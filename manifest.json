@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "echo360-subtitles",
+  "description": "A short description of what the extension does.",
+  "version": "1.0.0",
+  "content_scripts": [
+    {
+      "matches": ["https://echo360.net.au/*"],
+      "js": ["content-script.js"]
+    }
+  ]
+}
