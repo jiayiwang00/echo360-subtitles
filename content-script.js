@@ -24,6 +24,7 @@
     try { window.__subtitleWorkerAbort = true; } catch {}
     try { document.getElementById("__subtitle_bilingual_overlay")?.remove(); } catch {}
     try { document.getElementById("__subtitle_translation_progress")?.remove(); } catch {}
+    try { document.getElementById("__subtitle_translation_toggle")?.remove(); } catch {}
     try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
     delete window.__subtitleTranslatorCleanup;
     delete window.__subtitleTimer;
@@ -213,7 +214,7 @@
   progressDiv.id = "__subtitle_translation_progress";
   Object.assign(progressDiv.style, {
     position: "fixed",
-    top: "16px",
+    top: "64px",
     right: "16px",
     zIndex: "2147483647",
     width: "360px",
@@ -225,9 +226,60 @@
     lineHeight: "1.5",
     whiteSpace: "pre-wrap",
     boxShadow: "0 6px 24px rgba(0,0,0,0.35)",
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+    display: "none"
   });
   document.body.appendChild(progressDiv);
+
+  const toggleButton = document.createElement("button");
+  toggleButton.id = "__subtitle_translation_toggle";
+  toggleButton.type = "button";
+  toggleButton.textContent = "Translator";
+  toggleButton.setAttribute("aria-expanded", "false");
+  toggleButton.setAttribute("aria-controls", progressDiv.id);
+  Object.assign(toggleButton.style, {
+    position: "fixed",
+    top: "16px",
+    right: "16px",
+    zIndex: "2147483647",
+    padding: "8px 12px",
+    border: "0",
+    borderRadius: "999px",
+    color: "#fff",
+    background: "rgba(0,0,0,0.85)",
+    fontSize: "13px",
+    fontWeight: "600",
+    cursor: "pointer",
+    boxShadow: "0 6px 24px rgba(0,0,0,0.25)",
+    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+  });
+  document.body.appendChild(toggleButton);
+
+  let isProgressVisible = false;
+
+  function setProgressVisible(visible) {
+    isProgressVisible = visible;
+    progressDiv.style.display = visible ? "block" : "none";
+    toggleButton.setAttribute("aria-expanded", String(visible));
+    toggleButton.textContent = visible ? "Hide Translator" : "Translator";
+  }
+
+  toggleButton.addEventListener("click", event => {
+    event.stopPropagation();
+    setProgressVisible(!isProgressVisible);
+  });
+
+  document.addEventListener("click", event => {
+    if (!isProgressVisible) return;
+    if (progressDiv.contains(event.target) || toggleButton.contains(event.target)) return;
+    setProgressVisible(false);
+  });
+
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && isProgressVisible) {
+      setProgressVisible(false);
+    }
+  });
 
   const cache = new LRUCache(CONFIG.CACHE_LIMIT);
 
@@ -608,7 +660,7 @@
     const uniqueDone = [...textToIndices.keys()].filter(text => cache.has(text)).length;
 
     progressDiv.innerText =
-`Bilingual Subtitle Translator
+`Translation Progress
 --------------------------------
 VTT: ${vttUrl.slice(0, 72)}${vttUrl.length > 72 ? "..." : ""}
 总字幕条数: ${stats.total}
