@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Translation Progress</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <p class="eyebrow">Echo360 Subtitle Translator</p>
+      <h1>Translation Progress</h1>
+      <p id="statusText" class="status">Waiting for translation...</p>
+
+      <div class="meter" aria-hidden="true">
+        <div id="meterFill" class="meter-fill"></div>
+      </div>
+
+      <div class="stats">
+        <div class="stat">
+          <span class="label">Translated</span>
+          <span id="translatedValue" class="value">0/0</span>
+        </div>
+        <div class="stat">
+          <span class="label">Unique</span>
+          <span id="uniqueValue" class="value">0/0</span>
+        </div>
+        <div class="stat">
+          <span class="label">Queue</span>
+          <span id="queueValue" class="value">0</span>
+        </div>
+      </div>
+
+      <section class="snippet">
+        <p class="snippet-label">Current subtitle</p>
+        <p id="activeText" class="snippet-text">No active subtitle</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

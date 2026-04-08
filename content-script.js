@@ -18,6 +18,30 @@
     return;
   }
   window.__subtitleTranslatorRunning = true;
+  const PROGRESS_STORAGE_KEY = "translationProgress";
+
+  function writePopupState(progress) {
+    try {
+      if (!chrome?.storage?.local) return;
+      chrome.storage.local.set({ [PROGRESS_STORAGE_KEY]: progress });
+    } catch (error) {
+      console.warn("Failed to write popup state", error);
+    }
+  }
+
+  function clearPopupState() {
+    writePopupState({
+      running: false,
+      statusText: "Waiting for translation...",
+      translated: 0,
+      total: 0,
+      uniqueDone: 0,
+      uniqueTotal: 0,
+      queueLength: 0,
+      percent: 0,
+      activeText: ""
+    });
+  }
 
   function cleanup() {
     window.__subtitleTranslatorRunning = false;
@@ -29,19 +53,14 @@
       window.__subtitleRetryTimers?.clear?.();
     } catch {}
     try { document.getElementById("__subtitle_bilingual_overlay")?.remove(); } catch {}
-    try { document.getElementById("__subtitle_translation_progress")?.remove(); } catch {}
-    try { document.getElementById("__subtitle_translation_toggle")?.remove(); } catch {}
     try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
-    try { document.removeEventListener("click", window.__subtitleOnDocumentClick); } catch {}
-    try { document.removeEventListener("keydown", window.__subtitleOnDocumentKeydown); } catch {}
+    clearPopupState();
     delete window.__subtitleTranslatorCleanup;
     delete window.__subtitleTimer;
     delete window.__progressTimer;
     delete window.__subtitleRetryTimers;
     delete window.__subtitleVideo;
     delete window.__subtitleOnSeeked;
-    delete window.__subtitleOnDocumentClick;
-    delete window.__subtitleOnDocumentKeydown;
     console.log("🧹 Script cleaned up");
   }
 
@@ -244,81 +263,7 @@
     fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
   });
   document.body.appendChild(subtitleDiv);
-
-  const progressDiv = document.createElement("div");
-  progressDiv.id = "__subtitle_translation_progress";
-  Object.assign(progressDiv.style, {
-    position: "fixed",
-    top: "64px",
-    right: "16px",
-    zIndex: "2147483647",
-    width: "360px",
-    padding: "12px 14px",
-    color: "#fff",
-    background: "rgba(0,0,0,0.78)",
-    borderRadius: "10px",
-    fontSize: "13px",
-    lineHeight: "1.5",
-    whiteSpace: "pre-wrap",
-    boxShadow: "0 6px 24px rgba(0,0,0,0.35)",
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-    display: "none"
-  });
-  document.body.appendChild(progressDiv);
-
-  const toggleButton = document.createElement("button");
-  toggleButton.id = "__subtitle_translation_toggle";
-  toggleButton.type = "button";
-  toggleButton.textContent = "Translator";
-  toggleButton.setAttribute("aria-expanded", "false");
-  toggleButton.setAttribute("aria-controls", progressDiv.id);
-  Object.assign(toggleButton.style, {
-    position: "fixed",
-    top: "16px",
-    right: "16px",
-    zIndex: "2147483647",
-    padding: "8px 12px",
-    border: "0",
-    borderRadius: "999px",
-    color: "#fff",
-    background: "rgba(0,0,0,0.85)",
-    fontSize: "13px",
-    fontWeight: "600",
-    cursor: "pointer",
-    boxShadow: "0 6px 24px rgba(0,0,0,0.25)",
-    fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-  });
-  document.body.appendChild(toggleButton);
-
-  let isProgressVisible = false;
   let lastRenderedSubtitleText = "";
-
-  function setProgressVisible(visible) {
-    isProgressVisible = visible;
-    progressDiv.style.display = visible ? "block" : "none";
-    toggleButton.setAttribute("aria-expanded", String(visible));
-    toggleButton.textContent = visible ? "Hide Translator" : "Translator";
-    if (visible) renderProgress();
-  }
-
-  toggleButton.addEventListener("click", event => {
-    event.stopPropagation();
-    setProgressVisible(!isProgressVisible);
-  });
-
-  window.__subtitleOnDocumentClick = event => {
-    if (!isProgressVisible) return;
-    if (progressDiv.contains(event.target) || toggleButton.contains(event.target)) return;
-    setProgressVisible(false);
-  };
-  document.addEventListener("click", window.__subtitleOnDocumentClick);
-
-  window.__subtitleOnDocumentKeydown = event => {
-    if (event.key === "Escape" && isProgressVisible) {
-      setProgressVisible(false);
-    }
-  };
-  document.addEventListener("keydown", window.__subtitleOnDocumentKeydown);
 
   const cache = new LRUCache(CONFIG.CACHE_LIMIT);
 
@@ -355,6 +300,22 @@
     allDone: false,
     lastPriorityIndex: -1
   };
+
+  function syncPopupState() {
+    const uniqueTotal = textToIndices.size;
+    const translatedPercent = stats.total ? (stats.translated / stats.total) * 100 : 0;
+    writePopupState({
+      running: true,
+      statusText: stats.allDone ? "Translation complete" : "Translating",
+      translated: stats.translated,
+      total: stats.total,
+      uniqueDone: stats.uniqueDone,
+      uniqueTotal,
+      queueLength: queue.length,
+      percent: Number(translatedPercent.toFixed(1)),
+      activeText: stats.activeText
+    });
+  }
 
   const textToIndices = new Map();
   subtitles.forEach((sub, index) => {
@@ -423,6 +384,7 @@
       completedUniqueTexts.add(text);
       stats.uniqueDone = completedUniqueTexts.size;
     }
+    syncPopupState();
   }
 
   function scheduleRetry(text) {
@@ -436,6 +398,7 @@
     }, CONFIG.RETRY_DELAY);
 
     window.__subtitleRetryTimers.set(text, timer);
+    syncPopupState();
   }
 
   function markFailedForAll(text, err) {
@@ -447,6 +410,7 @@
 
     // Delay re-queueing to avoid spamming requests.
     scheduleRetry(text);
+    syncPopupState();
   }
 
   function reprioritizeQueuedText(text) {
@@ -491,6 +455,7 @@
     else queue.push(normalized);
 
     stats.currentQueueLength = queue.length;
+    syncPopupState();
   }
 
   async function workerLoop() {
@@ -500,6 +465,7 @@
     while (window.__subtitleTranslatorRunning && !window.__subtitleWorkerAbort) {
       const nextText = queue.shift();
       stats.currentQueueLength = queue.length;
+      syncPopupState();
 
       if (!nextText) {
         if (!stats.allDone) {
@@ -533,6 +499,7 @@
       } finally {
         inFlightTexts.delete(nextText);
         stats.currentQueueLength = queue.length;
+        syncPopupState();
       }
     }
 
@@ -710,33 +677,7 @@
   let lastIndex = -1;
 
   function renderProgress() {
-    const uniqueTotal = textToIndices.size;
-
-    progressDiv.innerText =
-`Translation Progress
---------------------------------
-VTT: ${vttUrl.slice(0, 72)}${vttUrl.length > 72 ? "..." : ""}
-Total number of subtitles: ${stats.total}
-Unique text count: ${uniqueTotal}
-
-Translated: ${stats.translated}/${stats.total} (${percent(stats.translated, stats.total)})
-Unique completed: ${stats.uniqueDone}/${uniqueTotal} (${percent(stats.uniqueDone, uniqueTotal)})
-Failure: ${stats.failed}
-Cache hits: ${stats.cacheHit}
-Requests sent: ${stats.requested}
-Queue remaining: ${queue.length}
-In flight: ${inFlightTexts.size}
-Cache size: ${cache.size()}
-Current priority center: ${stats.lastPriorityIndex}
-Running time: ${elapsedMs(Date.now() - stats.startedAt)}
-
-Current subtitle:
-${stats.activeText ? stats.activeText.slice(0, 90) : "(none)"}
-
-Recently completed:
-${stats.lastTranslatedText ? stats.lastTranslatedText.slice(0, 90) : "(none)"}
-
-Status: ${stats.allDone ? "Translation complete" : "Translating"}`;
+    syncPopupState();
   }
 
   window.__subtitleTimer = setInterval(() => {
@@ -752,6 +693,7 @@ Status: ${stats.allDone ? "Translation complete" : "Translating"}`;
 
     const sub = subtitles[index];
     stats.activeText = sub.text;
+    syncPopupState();
 
     if (index !== lastIndex) {
       lastIndex = index;
@@ -764,10 +706,10 @@ Status: ${stats.allDone ? "Translation complete" : "Translating"}`;
 
   window.__progressTimer = setInterval(() => {
     if (!window.__subtitleTranslatorRunning) return;
-    // Skip string building and DOM updates while the panel is hidden.
-    if (!isProgressVisible) return;
     renderProgress();
   }, CONFIG.PROGRESS_UPDATE_INTERVAL);
+
+  syncPopupState();
 
   console.log("Script started");
   console.log("Stop the script with: window.__subtitleTranslatorCleanup()");
