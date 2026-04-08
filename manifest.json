@@ -3,11 +3,16 @@
   "name": "Echo360 Subtitle Translator",
   "description": "Echo360 Subtitle Translator",
   "version": "1.0.0",
+  "permissions": ["storage"],
   "content_scripts": [
     {
       "matches": ["https://echo360.net.au/*"],
       "js": ["content-script.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": "popup/icon.png"
+  }
 }
