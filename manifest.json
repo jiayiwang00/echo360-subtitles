@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Echo360 Subtitle Translator",
-  "description": "Shows bilingual Echo360 subtitles with a click-to-open translation progress popup.",
+  "description": "Echo360 Subtitle Translator",
   "version": "1.0.0",
   "content_scripts": [
     {
