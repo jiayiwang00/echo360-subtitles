@@ -35,6 +35,54 @@ h1 {
   color: #5b6472;
 }
 
+.controls {
+  margin-bottom: 14px;
+}
+
+.control-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #8a6f3e;
+}
+
+.control-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.select,
+.button {
+  height: 38px;
+  border: 0;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.select {
+  padding: 0 12px;
+  background: #fff;
+  color: #1f2937;
+  box-shadow: inset 0 0 0 1px #eadfc7;
+}
+
+.button {
+  padding: 0 14px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(90deg, #b45309, #d97706);
+  cursor: pointer;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .meter {
   height: 10px;
   overflow: hidden;

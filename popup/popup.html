@@ -12,6 +12,14 @@
       <h1>Translation Progress</h1>
       <p id="statusText" class="status">Waiting for translation...</p>
 
+      <section class="controls">
+        <label class="control-label" for="languageSelect">Target language</label>
+        <div class="control-row">
+          <select id="languageSelect" class="select"></select>
+          <button id="translateButton" class="button" type="button">Translate</button>
+        </div>
+      </section>
+
       <div class="meter" aria-hidden="true">
         <div id="meterFill" class="meter-fill"></div>
       </div>
