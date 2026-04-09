@@ -19,6 +19,8 @@
   }
   window.__subtitleTranslatorRunning = true;
   const PROGRESS_STORAGE_KEY = "translationProgress";
+  const SETTINGS_STORAGE_KEY = "translationSettings";
+  const DEFAULT_TARGET_LANGUAGE = "zh-CN";
 
   function writePopupState(progress) {
     try {
@@ -43,6 +45,17 @@
     });
   }
 
+  async function getStoredTargetLanguage() {
+    try {
+      if (!chrome?.storage?.local) return DEFAULT_TARGET_LANGUAGE;
+      const result = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
+      return result?.[SETTINGS_STORAGE_KEY]?.targetLanguage || DEFAULT_TARGET_LANGUAGE;
+    } catch (error) {
+      console.warn("Failed to read translation settings", error);
+      return DEFAULT_TARGET_LANGUAGE;
+    }
+  }
+
   function cleanup() {
     window.__subtitleTranslatorRunning = false;
     try { clearInterval(window.__subtitleTimer); } catch {}
@@ -54,6 +67,7 @@
     } catch {}
     try { document.getElementById("__subtitle_bilingual_overlay")?.remove(); } catch {}
     try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
+    try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
     clearPopupState();
     delete window.__subtitleTranslatorCleanup;
     delete window.__subtitleTimer;
@@ -61,6 +75,7 @@
     delete window.__subtitleRetryTimers;
     delete window.__subtitleVideo;
     delete window.__subtitleOnSeeked;
+    delete window.__subtitleOnStorageChange;
     console.log("🧹 Script cleaned up");
   }
 
@@ -199,6 +214,9 @@
     has(key) {
       return this.map.has(key);
     }
+    clear() {
+      this.map.clear();
+    }
     size() {
       return this.map.size;
     }
@@ -300,13 +318,14 @@
     allDone: false,
     lastPriorityIndex: -1
   };
+  let targetLanguage = await getStoredTargetLanguage();
 
   function syncPopupState() {
     const uniqueTotal = textToIndices.size;
     const translatedPercent = stats.total ? (stats.translated / stats.total) * 100 : 0;
     writePopupState({
       running: true,
-      statusText: stats.allDone ? "Translation complete" : "Translating",
+      statusText: stats.allDone ? `Translation complete (${targetLanguage})` : `Translating to ${targetLanguage}`,
       translated: stats.translated,
       total: stats.total,
       uniqueDone: stats.uniqueDone,
@@ -330,7 +349,7 @@
 
   async function googleTranslate(text) {
     const url =
-      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=${encodeURIComponent(text)}`;
+      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLanguage)}&dt=t&q=${encodeURIComponent(text)}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -645,6 +664,56 @@
     }
   }
 
+  function resetTranslationState(nextLanguage) {
+    targetLanguage = nextLanguage || DEFAULT_TARGET_LANGUAGE;
+    lastRequestTime = 0;
+    queue.length = 0;
+    queuedTexts.clear();
+    inFlightTexts.clear();
+    scheduledUniqueTexts.clear();
+    completedUniqueTexts.clear();
+    cache.clear();
+
+    try {
+      for (const timer of window.__subtitleRetryTimers.values()) clearTimeout(timer);
+      window.__subtitleRetryTimers.clear();
+    } catch {}
+
+    for (const sub of subtitles) {
+      sub.translation = null;
+      sub.status = "pending";
+      sub.error = null;
+    }
+
+    stats.translated = 0;
+    stats.failed = 0;
+    stats.uniqueDone = 0;
+    stats.cacheHit = 0;
+    stats.requested = 0;
+    stats.currentQueueLength = 0;
+    stats.startedAt = Date.now();
+    stats.lastTranslatedText = "";
+    stats.allDone = false;
+    stats.lastPriorityIndex = -1;
+    lastRenderedSubtitleText = "";
+
+    const currentIndex = getSubtitleIndexByTime(video.currentTime);
+    if (currentIndex !== -1) {
+      enqueueWindowAround(currentIndex, CONFIG.PRIORITY_FORWARD, CONFIG.PRIORITY_BACKWARD);
+      enqueueRemainingFrom(currentIndex);
+      stats.lastPriorityIndex = currentIndex;
+    } else {
+      for (const text of textToIndices.keys()) {
+        scheduledUniqueTexts.add(text);
+        enqueueText(text, false);
+      }
+    }
+
+    renderSubtitle(null);
+    syncPopupState();
+    if (!stats.workerRunning) workerLoop();
+  }
+
   const startIndex = getSubtitleIndexByTime(video.currentTime);
   if (startIndex !== -1) {
     console.log("✅ Built priority queue from current playback position, index =", startIndex);
@@ -660,6 +729,14 @@
   }
 
   workerLoop();
+
+  window.__subtitleOnStorageChange = (changes, areaName) => {
+    if (areaName !== "local" || !changes[SETTINGS_STORAGE_KEY]) return;
+    const nextLanguage = changes[SETTINGS_STORAGE_KEY].newValue?.targetLanguage || DEFAULT_TARGET_LANGUAGE;
+    if (nextLanguage === targetLanguage) return;
+    resetTranslationState(nextLanguage);
+  };
+  chrome.storage.onChanged.addListener(window.__subtitleOnStorageChange);
 
   window.__subtitleOnSeeked = () => {
     const idx = getSubtitleIndexByTime(video.currentTime);
