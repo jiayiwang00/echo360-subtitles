@@ -1,6 +1,6 @@
-[中文](./README.md)
-
 # Echo360 Subtitle Translator
+
+English | [简体中文](./README.md)
 
 This is a Chrome extension for `Echo360`. It automatically reads `.vtt` subtitle files from the page and displays bilingual subtitles during video playback.
 
@@ -44,8 +44,3 @@ This extension currently only runs on `https://echo360.net.au/*`.
 - `content-script.js`: page integration, subtitle rendering, and video event handling
 - `translator-engine.js`: translation engine for concurrency, queues, caching, retries, and language switching
 - `popup/`: popup UI files and styles
-
-## Development Notes
-
-- After changing extension code, reload the extension from `chrome://extensions/`.
-- After reloading the extension, refresh the Echo360 page as well so the old content script is replaced.
