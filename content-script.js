@@ -6,7 +6,6 @@
     CACHE_LIMIT: 500,
     LOOKAHEAD_COUNT: 3,
     UI_UPDATE_INTERVAL: 100,
-    PROGRESS_UPDATE_INTERVAL: 500,
     POPUP_SYNC_INTERVAL: 200,
     MATCH_TOLERANCE: 0.15,
     INITIAL_RETRY_DELAY: 3000,
@@ -16,21 +15,29 @@
     PRIORITY_FORWARD: 20,
     PRIORITY_BACKWARD: 5
   };
+  const PROGRESS_STORAGE_KEY = "translationProgress";
+  const SETTINGS_STORAGE_KEY = "translationSettings";
+  const DEFAULT_TARGET_LANGUAGE = "zh-CN";
 
   if (window.__subtitleTranslatorRunning) {
     console.warn("The script is already running. Run window.__subtitleTranslatorCleanup() before starting it again.");
     return;
   }
   window.__subtitleTranslatorRunning = true;
-  const PROGRESS_STORAGE_KEY = "translationProgress";
-  const SETTINGS_STORAGE_KEY = "translationSettings";
-  const DEFAULT_TARGET_LANGUAGE = "zh-CN";
+  let isExtensionContextValid = true;
 
   function writePopupState(progress) {
+    if (!isExtensionContextValid) return;
     try {
       if (!chrome?.storage?.local) return;
       chrome.storage.local.set({ [PROGRESS_STORAGE_KEY]: progress });
     } catch (error) {
+      const message = String(error?.message || error || "");
+      if (message.includes("Extension context invalidated")) {
+        isExtensionContextValid = false;
+        try { window.__subtitleTranslatorCleanup?.(); } catch {}
+        return;
+      }
       console.warn("Failed to write popup state", error);
     }
   }
@@ -60,35 +67,6 @@
     }
   }
 
-  function cleanup() {
-    window.__subtitleTranslatorRunning = false;
-    try { clearInterval(window.__subtitleTimer); } catch {}
-    try { clearInterval(window.__progressTimer); } catch {}
-    try { window.__subtitleWorkerAbort = true; } catch {}
-    try {
-      for (const timer of window.__subtitleRetryTimers?.values() || []) clearTimeout(timer);
-      window.__subtitleRetryTimers?.clear?.();
-    } catch {}
-    try { clearTimeout(window.__subtitleBackgroundFillTimer); } catch {}
-    try { clearTimeout(window.__subtitlePopupSyncTimer); } catch {}
-    try { document.getElementById("__subtitle_bilingual_overlay")?.remove(); } catch {}
-    try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
-    try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
-    clearPopupState();
-    delete window.__subtitleTranslatorCleanup;
-    delete window.__subtitleTimer;
-    delete window.__progressTimer;
-    delete window.__subtitleRetryTimers;
-    delete window.__subtitleVideo;
-    delete window.__subtitleOnSeeked;
-    delete window.__subtitleOnStorageChange;
-    delete window.__subtitleBackgroundFillTimer;
-    delete window.__subtitlePopupSyncTimer;
-    console.log("🧹 Script cleaned up");
-  }
-
-  window.__subtitleTranslatorCleanup = cleanup;
-
   function findVttUrl() {
     const track = document.querySelector("track[kind='subtitles'], track[kind='captions']");
     if (track?.src) {
@@ -98,17 +76,17 @@
 
     const entries = performance.getEntriesByType("resource");
 
-    for (const e of entries) {
-      if (e.name.includes("captions") && e.name.endsWith(".vtt")) {
-        console.log("✅ Found captions VTT from network:", e.name);
-        return e.name;
+    for (const entry of entries) {
+      if (entry.name.includes("captions") && entry.name.endsWith(".vtt")) {
+        console.log("✅ Found captions VTT from network:", entry.name);
+        return entry.name;
       }
     }
 
-    for (const e of entries) {
-      if (e.name.endsWith(".vtt")) {
-        console.log("✅ Found VTT from network:", e.name);
-        return e.name;
+    for (const entry of entries) {
+      if (entry.name.endsWith(".vtt")) {
+        console.log("✅ Found VTT from network:", entry.name);
+        return entry.name;
       }
     }
 
@@ -117,15 +95,16 @@
 
   function waitForVideo(timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
-      const start = Date.now();
+      const startedAt = Date.now();
       const timer = setInterval(() => {
-        const v = document.querySelector("video");
-        if (v) {
+        const video = document.querySelector("video");
+        if (video) {
           clearInterval(timer);
-          resolve(v);
+          resolve(video);
           return;
         }
-        if (Date.now() - start > timeoutMs) {
+
+        if (Date.now() - startedAt > timeoutMs) {
           clearInterval(timer);
           reject(new Error("Timed out waiting for video"));
         }
@@ -133,10 +112,10 @@
     });
   }
 
-  function toSec(t) {
-    const normalized = String(t).replace(",", ".");
-    const [h, m, s] = normalized.split(":");
-    return (+h) * 3600 + (+m) * 60 + parseFloat(s);
+  function toSec(time) {
+    const normalized = String(time).replace(",", ".");
+    const [hours, minutes, seconds] = normalized.split(":");
+    return (+hours) * 3600 + (+minutes) * 60 + parseFloat(seconds);
   }
 
   function isTimingLine(line) {
@@ -160,86 +139,53 @@
 
   function parseVTT(vtt) {
     const lines = vtt.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-    const subs = [];
-    let cur = null;
+    const subtitles = [];
+    let current = null;
 
-    for (let rawLine of lines) {
+    for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line || line.startsWith("WEBVTT") || line.startsWith("NOTE")) continue;
       if (line.startsWith("STYLE") || line.startsWith("REGION")) {
-        cur = null;
+        current = null;
         continue;
       }
 
       if (isTimingLine(line)) {
         const timing = parseTimingLine(line);
         if (!timing) continue;
-        cur = {
+        current = {
           start: timing.start,
           end: timing.end,
           text: "",
           translation: null,
-          status: "pending", // pending | queued | translating | done | failed
+          status: "pending",
           error: null
         };
-        subs.push(cur);
-      } else if (/^\d+$/.test(line) && !cur) {
-        // Skip cue identifiers so numeric indexes do not get merged into subtitle text.
+        subtitles.push(current);
+      } else if (/^\d+$/.test(line) && !current) {
         continue;
-      } else if (cur) {
-        const clean = line.replace(/<[^>]+>/g, "");
-        cur.text += clean + " ";
+      } else if (current) {
+        current.text += line.replace(/<[^>]+>/g, "") + " ";
       }
     }
 
-    for (const s of subs) {
-      s.text = normalizeText(s.text);
+    for (const subtitle of subtitles) {
+      subtitle.text = normalizeText(subtitle.text);
     }
 
-    return subs.filter(s => s.text);
+    return subtitles.filter(subtitle => subtitle.text);
   }
 
-  class LRUCache {
-    constructor(limit = 500) {
-      this.limit = limit;
-      this.map = new Map();
-    }
-    get(key) {
-      if (!this.map.has(key)) return null;
-      const val = this.map.get(key);
-      this.map.delete(key);
-      this.map.set(key, val);
-      return val;
-    }
-    set(key, val) {
-      if (this.map.has(key)) this.map.delete(key);
-      this.map.set(key, val);
-      if (this.map.size > this.limit) {
-        const firstKey = this.map.keys().next().value;
-        this.map.delete(firstKey);
-      }
-    }
-    has(key) {
-      return this.map.has(key);
-    }
-    clear() {
-      this.map.clear();
-    }
-    size() {
-      return this.map.size;
-    }
-  }
-
-  let vttUrl = findVttUrl();
-  if (!vttUrl) {
+  const vttUrl = findVttUrl() || await (async () => {
     console.log("VTT not found, waiting and retrying...");
-    await new Promise(r => setTimeout(r, CONFIG.INITIAL_RETRY_DELAY));
-    vttUrl = findVttUrl();
-  }
+    await new Promise(resolve => setTimeout(resolve, CONFIG.INITIAL_RETRY_DELAY));
+    return findVttUrl();
+  })();
 
   if (!vttUrl) {
     console.error("❌ VTT not found");
-    cleanup();
+    clearPopupState();
+    window.__subtitleTranslatorRunning = false;
     return;
   }
 
@@ -248,9 +194,10 @@
     video = await waitForVideo();
     window.__subtitleVideo = video;
     console.log("✅ Found video:", video);
-  } catch (e) {
-    console.error("❌", e);
-    cleanup();
+  } catch (error) {
+    console.error("❌", error);
+    clearPopupState();
+    window.__subtitleTranslatorRunning = false;
     return;
   }
 
@@ -277,389 +224,44 @@
     fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
   });
   document.body.appendChild(subtitleDiv);
-  let lastRenderedSubtitleText = "";
-
-  const cachesByLanguage = new Map();
-
-  function getLanguageCache(language = targetLanguage) {
-    if (!cachesByLanguage.has(language)) {
-      cachesByLanguage.set(language, new LRUCache(CONFIG.CACHE_LIMIT));
-    }
-    return cachesByLanguage.get(language);
-  }
 
   let subtitles = [];
   try {
-    const res = await fetch(vttUrl);
-    const text = await res.text();
+    const response = await fetch(vttUrl);
+    const text = await response.text();
     subtitles = parseVTT(text);
     console.log("Subtitles loaded:", subtitles.length, "entries");
-  } catch (e) {
-    console.error("Failed to load VTT", e);
-    cleanup();
+  } catch (error) {
+    console.error("Failed to load VTT", error);
+    subtitleDiv.remove();
+    clearPopupState();
+    window.__subtitleTranslatorRunning = false;
     return;
   }
 
   if (!subtitles.length) {
     console.error("VTT parsing returned no subtitles");
-    cleanup();
+    subtitleDiv.remove();
+    clearPopupState();
+    window.__subtitleTranslatorRunning = false;
     return;
   }
 
-  const stats = {
-    total: subtitles.length,
-    translated: 0,
-    failed: 0,
-    uniqueDone: 0,
-    cacheHit: 0,
-    requested: 0,
-    currentQueueLength: 0,
-    startedAt: Date.now(),
-    lastTranslatedText: "",
-    activeText: "",
-    workerRunning: false,
-    allDone: false,
-    lastPriorityIndex: -1
-  };
-  let targetLanguage = await getStoredTargetLanguage();
-  let generation = 0;
-  let nextRequestAt = 0;
-  let requestSlotChain = Promise.resolve();
-
-  // Keep urgent subtitle fetches separate from background prefetching so seeks stay responsive.
-  const engine = {
-    urgentQueue: [],
-    backgroundQueue: [],
-    queuedPriority: new Map(),
-    inFlightKeys: new Set(),
-    scheduledUniqueTexts: new Set(),
-    completedUniqueTexts: new Set(),
-    retryAttempts: new Map(),
-    workersStarted: false
-  };
-
-  window.__subtitleRetryTimers = new Map();
-
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  function getQueueLength() {
-    return engine.urgentQueue.length + engine.backgroundQueue.length;
-  }
-
-  function updateQueueStats() {
-    stats.currentQueueLength = getQueueLength();
-  }
-
-  function makeGenerationTextKey(targetGeneration, text) {
-    return `${targetGeneration}::${text}`;
-  }
-
-  function requestPopupSync(immediate = false) {
-    if (immediate) {
-      try { clearTimeout(window.__subtitlePopupSyncTimer); } catch {}
-      window.__subtitlePopupSyncTimer = null;
-      syncPopupState();
-      return;
-    }
-
-    if (window.__subtitlePopupSyncTimer) return;
-    window.__subtitlePopupSyncTimer = setTimeout(() => {
-      window.__subtitlePopupSyncTimer = null;
-      syncPopupState();
-    }, CONFIG.POPUP_SYNC_INTERVAL);
-  }
-
-  function syncPopupState() {
-    const uniqueTotal = textToIndices.size;
-    const translatedPercent = stats.total ? (stats.translated / stats.total) * 100 : 0;
-    writePopupState({
-      running: true,
-      statusText: stats.allDone ? `Translation complete (${targetLanguage})` : `Translating to ${targetLanguage}`,
-      translated: stats.translated,
-      total: stats.total,
-      uniqueDone: stats.uniqueDone,
-      uniqueTotal,
-      queueLength: getQueueLength(),
-      percent: Number(translatedPercent.toFixed(1)),
-      activeText: stats.activeText
-    });
-  }
-
-  const textToIndices = new Map();
-  subtitles.forEach((sub, index) => {
-    const key = sub.text;
-    if (!textToIndices.has(key)) textToIndices.set(key, []);
-    textToIndices.get(key).push(index);
-  });
-
-  window.__subtitleWorkerAbort = false;
-
-  async function googleTranslate(text, language) {
-    const url =
-      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(language)}&dt=t&q=${encodeURIComponent(text)}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    return data?.[0]?.map(x => x[0]).join("") || "";
-  }
-
-  async function waitForRequestSlot() {
-    let releaseLock;
-    const previous = requestSlotChain;
-    requestSlotChain = new Promise(resolve => {
-      releaseLock = resolve;
-    });
-
-    await previous;
-    try {
-      const wait = Math.max(0, nextRequestAt - Date.now());
-      if (wait > 0) await sleep(wait);
-      nextRequestAt = Date.now() + CONFIG.REQUEST_SPACING_MS;
-    } finally {
-      releaseLock();
-    }
-  }
-
-  async function translateRateLimited(text, language) {
-    await waitForRequestSlot();
-    stats.requested += 1;
-    requestPopupSync();
-    return googleTranslate(text, language);
-  }
-
-  function markAllSameText(text, updater) {
-    const indices = textToIndices.get(text) || [];
-    for (const i of indices) updater(subtitles[i], i);
-  }
-
-  function updateSubtitleState(sub, nextStatus, extras = {}) {
-    const prevStatus = sub.status;
-
-    if (prevStatus === "done" && nextStatus !== "done") stats.translated -= 1;
-    if (prevStatus === "failed" && nextStatus !== "failed") stats.failed -= 1;
-    if (prevStatus !== "done" && nextStatus === "done") stats.translated += 1;
-    if (prevStatus !== "failed" && nextStatus === "failed") stats.failed += 1;
-
-    sub.status = nextStatus;
-    if (Object.prototype.hasOwnProperty.call(extras, "translation")) sub.translation = extras.translation;
-    if (Object.prototype.hasOwnProperty.call(extras, "error")) sub.error = extras.error;
-  }
-
-  function clearRetryState(text, targetGeneration) {
-    const retryKey = makeGenerationTextKey(targetGeneration, text);
-    if (window.__subtitleRetryTimers.has(retryKey)) {
-      clearTimeout(window.__subtitleRetryTimers.get(retryKey));
-      window.__subtitleRetryTimers.delete(retryKey);
-    }
-    engine.retryAttempts.delete(retryKey);
-  }
-
-  function getHttpStatus(error) {
-    const match = String(error?.message || "").match(/HTTP\s+(\d{3})/);
-    return match ? Number(match[1]) : null;
-  }
-
-  function getRetryDelay(error, attempt) {
-    const status = getHttpStatus(error);
-    const baseDelay = status === 429 ? 2500 : status && status >= 500 ? 1800 : CONFIG.RETRY_DELAY;
-    const exponentialDelay = baseDelay * Math.pow(2, Math.min(attempt - 1, 4));
-    const jitter = Math.floor(Math.random() * 350);
-    return Math.min(CONFIG.MAX_RETRY_DELAY, exponentialDelay + jitter);
-  }
-
-  function applyTranslationToAll(text, translation, targetGeneration, language) {
-    // Ignore late responses from a previous language or queue generation.
-    if (targetGeneration !== generation || language !== targetLanguage) return;
-
-    clearRetryState(text, targetGeneration);
-
-    markAllSameText(text, sub => {
-      updateSubtitleState(sub, "done", { translation, error: null });
-    });
-
-    if (!engine.completedUniqueTexts.has(text)) {
-      engine.completedUniqueTexts.add(text);
-      stats.uniqueDone = engine.completedUniqueTexts.size;
-    }
-    requestPopupSync();
-  }
-
-  function scheduleRetry(text, error, targetGeneration) {
-    const retryKey = makeGenerationTextKey(targetGeneration, text);
-    if (window.__subtitleRetryTimers.has(retryKey)) return;
-    stats.allDone = false;
-    const nextAttempt = (engine.retryAttempts.get(retryKey) || 0) + 1;
-    engine.retryAttempts.set(retryKey, nextAttempt);
-    const delay = getRetryDelay(error, nextAttempt);
-
-    const timer = setTimeout(() => {
-      window.__subtitleRetryTimers.delete(retryKey);
-      if (!window.__subtitleTranslatorRunning || targetGeneration !== generation) return;
-      enqueueText(text, "background");
-    }, delay);
-
-    window.__subtitleRetryTimers.set(retryKey, timer);
-    requestPopupSync();
-  }
-
-  function markFailedForAll(text, err, targetGeneration, language) {
-    if (targetGeneration !== generation || language !== targetLanguage) return;
-
-    markAllSameText(text, sub => {
-      if (sub.status !== "done") {
-        updateSubtitleState(sub, "failed", { error: String(err?.message || err) });
-      }
-    });
-
-    scheduleRetry(text, err, targetGeneration);
-    requestPopupSync();
-  }
-
-  function getActiveCache() {
-    return getLanguageCache(targetLanguage);
-  }
-
-  function removeFromQueue(queue, text) {
-    const index = queue.indexOf(text);
-    if (index === -1) return false;
-    queue.splice(index, 1);
-    return true;
-  }
-
-  function dequeueNextText() {
-    const nextText = engine.urgentQueue.shift() || engine.backgroundQueue.shift() || null;
-    if (nextText) {
-      engine.queuedPriority.delete(nextText);
-      updateQueueStats();
-    }
-    return nextText;
-  }
-
-  function enqueueText(text, priority = "background") {
-    const normalized = normalizeText(text);
-    if (!normalized) return;
-    stats.allDone = false;
-    const activeCache = getActiveCache();
-    const inFlightKey = makeGenerationTextKey(generation, normalized);
-
-    if (activeCache.has(normalized)) {
-      const cached = activeCache.get(normalized);
-      stats.cacheHit += 1;
-      applyTranslationToAll(normalized, cached, generation, targetLanguage);
-      return;
-    }
-
-    if (engine.inFlightKeys.has(inFlightKey)) return;
-
-    const existingPriority = engine.queuedPriority.get(normalized);
-    if (existingPriority) {
-      if (priority === "urgent" && existingPriority !== "urgent") {
-        removeFromQueue(engine.backgroundQueue, normalized);
-        engine.urgentQueue.unshift(normalized);
-        engine.queuedPriority.set(normalized, "urgent");
-        updateQueueStats();
-        requestPopupSync();
-      }
-      return;
-    }
-
-    markAllSameText(normalized, sub => {
-      if (sub.status === "pending" || sub.status === "failed") {
-        updateSubtitleState(sub, "queued");
-      }
-    });
-
-    engine.queuedPriority.set(normalized, priority);
-    if (priority === "urgent") engine.urgentQueue.unshift(normalized);
-    else engine.backgroundQueue.push(normalized);
-
-    updateQueueStats();
-    requestPopupSync();
-  }
-
-  function isTranslationResolved() {
-    const hasRetryPending = window.__subtitleRetryTimers.size > 0;
-    const hasBackgroundFillScheduled = Boolean(window.__subtitleBackgroundFillTimer);
-    return (
-      stats.translated === stats.total &&
-      getQueueLength() === 0 &&
-      engine.inFlightKeys.size === 0 &&
-      !hasRetryPending &&
-      !hasBackgroundFillScheduled
-    );
-  }
-
-  async function workerLoop() {
-    while (window.__subtitleTranslatorRunning && !window.__subtitleWorkerAbort) {
-      const nextText = dequeueNextText();
-      requestPopupSync();
-
-      if (!nextText) {
-        if (!stats.allDone) {
-          if (isTranslationResolved()) {
-            stats.allDone = true;
-            requestPopupSync(true);
-          }
-        }
-        await sleep(120);
-        continue;
-      }
-
-      const requestGeneration = generation;
-      const requestLanguage = targetLanguage;
-      const inFlightKey = makeGenerationTextKey(requestGeneration, nextText);
-      engine.inFlightKeys.add(inFlightKey);
-
-      markAllSameText(nextText, sub => {
-        if (sub.status !== "done") updateSubtitleState(sub, "translating");
-      });
-      requestPopupSync();
-
-      try {
-        const translation = await translateRateLimited(nextText, requestLanguage);
-        if (requestGeneration !== generation || requestLanguage !== targetLanguage) continue;
-        getLanguageCache(requestLanguage).set(nextText, translation);
-        applyTranslationToAll(nextText, translation, requestGeneration, requestLanguage);
-        stats.lastTranslatedText = nextText;
-      } catch (e) {
-        console.warn("Translation failed:", nextText, e);
-        markFailedForAll(nextText, e, requestGeneration, requestLanguage);
-      } finally {
-        engine.inFlightKeys.delete(inFlightKey);
-        updateQueueStats();
-        requestPopupSync();
-      }
-    }
-  }
-
-  function ensureWorkers() {
-    if (engine.workersStarted) return;
-    engine.workersStarted = true;
-    stats.workerRunning = true;
-
-    for (let i = 0; i < CONFIG.MAX_CONCURRENT_REQUESTS; i++) {
-      workerLoop().catch(error => {
-        console.error("Subtitle worker crashed", error);
-      });
-    }
-  }
-
   let cursor = 0;
+  let lastRenderedSubtitleText = "";
 
-  function getSubtitleIndexByTime(t) {
-    const tol = CONFIG.MATCH_TOLERANCE;
+  function getSubtitleIndexByTime(time) {
+    const tolerance = CONFIG.MATCH_TOLERANCE;
 
-    while (cursor < subtitles.length - 1 && t > subtitles[cursor].end + tol) cursor++;
-    while (cursor > 0 && t < subtitles[cursor].start - tol) cursor--;
+    while (cursor < subtitles.length - 1 && time > subtitles[cursor].end + tolerance) cursor++;
+    while (cursor > 0 && time < subtitles[cursor].start - tolerance) cursor--;
 
-    const s = subtitles[cursor];
-    if (s && t >= s.start - tol && t <= s.end + tol) return cursor;
+    const current = subtitles[cursor];
+    if (current && time >= current.start - tolerance && time <= current.end + tolerance) return cursor;
 
     for (let i = Math.max(0, cursor - 5); i <= Math.min(subtitles.length - 1, cursor + 5); i++) {
-      const x = subtitles[i];
-      if (t >= x.start - tol && t <= x.end + tol) {
+      const candidate = subtitles[i];
+      if (time >= candidate.start - tolerance && time <= candidate.end + tolerance) {
         cursor = i;
         return i;
       }
@@ -668,264 +270,102 @@
     return -1;
   }
 
-  function getBestTranslation(sub) {
-    if (!sub || !sub.text) return null;
-    if (sub.translation) return sub.translation;
-
-    const cached = getActiveCache().get(sub.text);
-    if (cached) {
-      applyTranslationToAll(sub.text, cached, generation, targetLanguage);
-      return cached;
-    }
-
-    return null;
-  }
+  const engine = new window.SubtitleTranslationEngine({
+    config: CONFIG,
+    subtitles,
+    initialLanguage: await getStoredTargetLanguage(),
+    defaultLanguage: DEFAULT_TARGET_LANGUAGE,
+    getCurrentIndex: () => getSubtitleIndexByTime(video.currentTime),
+    onProgress: progress => writePopupState(progress)
+  });
 
   function renderSubtitle(sub) {
     let nextText = "";
 
     if (sub) {
-      const en = sub.text || "";
-      const translation = getBestTranslation(sub);
-
+      const translation = engine.getBestTranslation(sub);
       if (translation) {
-        nextText = `${en}\n${translation}`;
+        nextText = `${sub.text}\n${translation}`;
       } else if (sub.status === "failed") {
-        // Do not leave the subtitle stuck in a loading state after failures.
-        nextText = `${en}\n(Translation failed)`;
+        nextText = `${sub.text}\n(Translation failed)`;
       } else {
-        nextText = `${en}\n⏳ Translating...`;
+        nextText = `${sub.text}\n⏳ Translating...`;
       }
     }
 
-    // Avoid DOM writes when nothing changes; this is one of the hottest paths during playback.
     if (nextText !== lastRenderedSubtitleText) {
       subtitleDiv.innerText = nextText;
       lastRenderedSubtitleText = nextText;
     }
   }
 
-  function requestImmediateTranslationForIndex(index) {
-    const sub = subtitles[index];
-    if (!sub || !sub.text) return;
-
-    if (sub.translation) return;
-
-    const cached = getActiveCache().get(sub.text);
-    if (cached) {
-      applyTranslationToAll(sub.text, cached, generation, targetLanguage);
-      return;
-    }
-
-    if (sub.status === "translating") return;
-
-    enqueueText(sub.text, "urgent");
+  function cleanup() {
+    window.__subtitleTranslatorRunning = false;
+    isExtensionContextValid = false;
+    try { clearInterval(window.__subtitleTimer); } catch {}
+    try { engine.destroy(); } catch {}
+    try { subtitleDiv.remove(); } catch {}
+    try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
+    try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
+    clearPopupState();
+    delete window.__subtitleTranslatorCleanup;
+    delete window.__subtitleTimer;
+    delete window.__subtitleVideo;
+    delete window.__subtitleOnSeeked;
+    delete window.__subtitleOnStorageChange;
+    console.log("🧹 Script cleaned up");
   }
 
-  function boostLookahead(index) {
-    for (let i = 0; i <= CONFIG.LOOKAHEAD_COUNT; i++) {
-      const targetIndex = index + i;
-      const s = subtitles[targetIndex];
-      if (!s || !s.text) continue;
-
-      if (s.translation) continue;
-
-      const cached = getActiveCache().get(s.text);
-      if (cached) {
-        applyTranslationToAll(s.text, cached, generation, targetLanguage);
-        continue;
-      }
-
-      enqueueText(s.text, "urgent");
-    }
-  }
-
-  function enqueueWindowAround(index, forward = CONFIG.PRIORITY_FORWARD, backward = CONFIG.PRIORITY_BACKWARD) {
-    if (index < 0) return;
-
-    const current = subtitles[index];
-    if (current?.text) enqueueText(current.text, "urgent");
-
-    for (let i = 1; i <= forward; i++) {
-      const s = subtitles[index + i];
-      if (s?.text) enqueueText(s.text, "urgent");
-    }
-
-    for (let i = 1; i <= backward; i++) {
-      const s = subtitles[index - i];
-      if (s?.text) enqueueText(s.text, "urgent");
-    }
-  }
-
-  function enqueueRemainingFrom(index) {
-    const orderedTexts = [];
-    const localSeen = new Set();
-
-    for (let i = index; i < subtitles.length; i++) {
-      const text = subtitles[i]?.text;
-      if (text && !localSeen.has(text)) {
-        localSeen.add(text);
-        orderedTexts.push(text);
-      }
-    }
-
-    for (let i = 0; i < index; i++) {
-      const text = subtitles[i]?.text;
-      if (text && !localSeen.has(text)) {
-        localSeen.add(text);
-        orderedTexts.push(text);
-      }
-    }
-
-    for (const text of orderedTexts) {
-      if (!engine.scheduledUniqueTexts.has(text)) {
-        engine.scheduledUniqueTexts.add(text);
-        enqueueText(text, "background");
-      }
-    }
-  }
-
-  function scheduleBackgroundFill(index, delay = CONFIG.BACKGROUND_FILL_DELAY) {
-    try { clearTimeout(window.__subtitleBackgroundFillTimer); } catch {}
-    const targetGeneration = generation;
-    window.__subtitleBackgroundFillTimer = setTimeout(() => {
-      window.__subtitleBackgroundFillTimer = null;
-      if (!window.__subtitleTranslatorRunning || targetGeneration !== generation) return;
-      enqueueRemainingFrom(index);
-      requestPopupSync();
-    }, delay);
-  }
-
-  function resetTranslationState(nextLanguage) {
-    generation += 1;
-    targetLanguage = nextLanguage || DEFAULT_TARGET_LANGUAGE;
-    nextRequestAt = 0;
-    engine.urgentQueue.length = 0;
-    engine.backgroundQueue.length = 0;
-    engine.queuedPriority.clear();
-    engine.inFlightKeys.clear();
-    engine.scheduledUniqueTexts.clear();
-    engine.completedUniqueTexts.clear();
-
-    try {
-      for (const timer of window.__subtitleRetryTimers.values()) clearTimeout(timer);
-      window.__subtitleRetryTimers.clear();
-    } catch {}
-    try { clearTimeout(window.__subtitleBackgroundFillTimer); } catch {}
-    window.__subtitleBackgroundFillTimer = null;
-    engine.retryAttempts.clear();
-
-    for (const sub of subtitles) {
-      sub.translation = null;
-      sub.status = "pending";
-      sub.error = null;
-    }
-
-    stats.translated = 0;
-    stats.failed = 0;
-    stats.uniqueDone = 0;
-    stats.cacheHit = 0;
-    stats.requested = 0;
-    stats.currentQueueLength = 0;
-    stats.startedAt = Date.now();
-    stats.lastTranslatedText = "";
-    stats.activeText = "";
-    stats.allDone = false;
-    stats.lastPriorityIndex = -1;
-    lastRenderedSubtitleText = "";
-
-    const currentIndex = getSubtitleIndexByTime(video.currentTime);
-    if (currentIndex !== -1) {
-      enqueueWindowAround(currentIndex, CONFIG.PRIORITY_FORWARD, CONFIG.PRIORITY_BACKWARD);
-      scheduleBackgroundFill(currentIndex, 0);
-      stats.lastPriorityIndex = currentIndex;
-    } else {
-      for (const text of textToIndices.keys()) {
-        engine.scheduledUniqueTexts.add(text);
-        enqueueText(text, "background");
-      }
-    }
-
-    renderSubtitle(null);
-    requestPopupSync(true);
-    ensureWorkers();
-  }
+  window.__subtitleTranslatorCleanup = cleanup;
 
   const startIndex = getSubtitleIndexByTime(video.currentTime);
   if (startIndex !== -1) {
     console.log("✅ Built priority queue from current playback position, index =", startIndex);
-    enqueueWindowAround(startIndex, CONFIG.PRIORITY_FORWARD, CONFIG.PRIORITY_BACKWARD);
-    scheduleBackgroundFill(startIndex);
-    stats.lastPriorityIndex = startIndex;
   } else {
     console.log("⚠️ No subtitle matched the current playback time, falling back to the full queue");
-    for (const text of textToIndices.keys()) {
-      engine.scheduledUniqueTexts.add(text);
-      enqueueText(text, "background");
-    }
   }
-
-  ensureWorkers();
+  engine.start(startIndex);
 
   window.__subtitleOnStorageChange = (changes, areaName) => {
     if (areaName !== "local" || !changes[SETTINGS_STORAGE_KEY]) return;
     const nextLanguage = changes[SETTINGS_STORAGE_KEY].newValue?.targetLanguage || DEFAULT_TARGET_LANGUAGE;
-    if (nextLanguage === targetLanguage) return;
-    resetTranslationState(nextLanguage);
+    engine.setTargetLanguage(nextLanguage);
+    lastRenderedSubtitleText = "";
+    renderSubtitle(null);
   };
   chrome.storage.onChanged.addListener(window.__subtitleOnStorageChange);
 
   window.__subtitleOnSeeked = () => {
-    const idx = getSubtitleIndexByTime(video.currentTime);
-    console.log("⏩ User seeked to:", video.currentTime, "index:", idx);
-
-    if (idx !== -1) {
-      enqueueWindowAround(idx, CONFIG.PRIORITY_FORWARD, CONFIG.PRIORITY_BACKWARD);
-      scheduleBackgroundFill(idx);
-      stats.lastPriorityIndex = idx;
-      requestPopupSync();
-    }
+    const index = getSubtitleIndexByTime(video.currentTime);
+    console.log("⏩ User seeked to:", video.currentTime, "index:", index);
+    engine.handleSeek(index);
   };
-
   video.addEventListener("seeked", window.__subtitleOnSeeked);
 
   let lastIndex = -1;
-
-  function renderProgress() {
-    requestPopupSync(true);
-  }
-
   window.__subtitleTimer = setInterval(() => {
     if (!window.__subtitleTranslatorRunning) return;
 
-    const t = video.currentTime;
-    const index = getSubtitleIndexByTime(t);
-
+    const index = getSubtitleIndexByTime(video.currentTime);
     if (index === -1) {
-      stats.activeText = "";
+      engine.setActiveText("");
       renderSubtitle(null);
       return;
     }
 
-    const sub = subtitles[index];
-    stats.activeText = sub.text;
-    syncPopupState();
+    const subtitle = subtitles[index];
+    engine.setActiveText(subtitle.text);
 
     if (index !== lastIndex) {
       lastIndex = index;
-      requestImmediateTranslationForIndex(index);
-      boostLookahead(index);
+      engine.requestImmediateTranslationForIndex(index);
+      engine.boostLookahead(index);
     }
 
-    renderSubtitle(sub);
+    renderSubtitle(subtitle);
   }, CONFIG.UI_UPDATE_INTERVAL);
 
-  window.__progressTimer = setInterval(() => {
-    if (!window.__subtitleTranslatorRunning) return;
-    renderProgress();
-  }, CONFIG.PROGRESS_UPDATE_INTERVAL);
-
-  syncPopupState();
+  engine.syncProgress(true);
 
   console.log("Script started");
   console.log("Stop the script with: window.__subtitleTranslatorCleanup()");
