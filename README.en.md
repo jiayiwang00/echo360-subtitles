@@ -28,19 +28,3 @@ This extension currently only runs on `https://echo360.net.au/*`.
 3. Turn on `Developer mode` in the top-right corner.
 4. Click `Load unpacked`.
 5. Select this project folder, making sure it contains `manifest.json`.
-
-## Usage
-
-1. Load the project as a Chrome extension.
-2. Open an Echo360 video page.
-3. Wait for the extension to detect subtitles and start translating.
-4. Click the extension icon in the browser toolbar to open the popup.
-5. Select a target language from the dropdown and click `Translate`.
-6. Play the video or jump to any timestamp. The extension will prioritize subtitles near the current playback position.
-
-## Project Structure
-
-- `manifest.json`: Chrome extension configuration
-- `content-script.js`: page integration, subtitle rendering, and video event handling
-- `translator-engine.js`: translation engine for concurrency, queues, caching, retries, and language switching
-- `popup/`: popup UI files and styles
