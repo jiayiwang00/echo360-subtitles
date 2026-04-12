@@ -28,19 +28,3 @@ Note: This code was generated with AI assistance [ChatGPT/Codex]
 3. 打开右上角的“开发者模式”
 4. 点击“加载已解压的扩展程序”
 5. 选择当前项目目录，确保其中包含 `manifest.json`
-
-## 使用方式
-
-1. 将项目作为 Chrome 扩展加载
-2. 打开 Echo360 视频页面
-3. 等待扩展自动读取字幕并开始翻译
-4. 点击浏览器工具栏中的扩展图标，打开 popup
-5. 在下拉框中选择目标语言，点击“翻译”
-6. 播放视频或跳转到任意时间点，扩展会优先翻译当前附近的字幕
-
-## 项目结构
-
-- `manifest.json`：Chrome 扩展配置
-- `content-script.js`：页面集成、字幕渲染、视频事件监听
-- `translator-engine.js`：翻译调度引擎，包括并发、队列、缓存、重试和语言切换逻辑
-- `popup/`：扩展 popup 界面和样式
