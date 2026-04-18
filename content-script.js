@@ -112,6 +112,63 @@
     });
   }
 
+  function findVideoContainer(videoElement) {
+    const videoRect = videoElement.getBoundingClientRect();
+    let bestContainer = videoElement.parentElement;
+
+    for (let element = videoElement.parentElement; element && element !== document.body; element = element.parentElement) {
+      const rect = element.getBoundingClientRect();
+      const containsVideo = rect.width >= videoRect.width && rect.height >= videoRect.height;
+      const isReasonableSize = rect.width >= 240 && rect.height >= 135;
+
+      if (containsVideo && isReasonableSize) {
+        bestContainer = element;
+      }
+
+      const name = `${element.id || ""} ${element.className || ""}`.toLowerCase();
+      if (containsVideo && /\b(player|video|media|echo|presentation)\b/.test(name)) {
+        return element;
+      }
+    }
+
+    return bestContainer || videoElement.parentElement || document.documentElement;
+  }
+
+  function patchVideoFullscreen(videoElement) {
+    const fullscreenHost = findVideoContainer(videoElement);
+    if (!fullscreenHost || fullscreenHost === videoElement) return () => {};
+
+    const methods = [
+      ["requestFullscreen", "requestFullscreen"],
+      ["webkitRequestFullscreen", "webkitRequestFullscreen"],
+      ["webkitRequestFullScreen", "webkitRequestFullScreen"],
+      ["mozRequestFullScreen", "mozRequestFullScreen"],
+      ["msRequestFullscreen", "msRequestFullscreen"]
+    ];
+    const originals = [];
+
+    for (const [videoMethod, hostMethod] of methods) {
+      if (typeof videoElement[videoMethod] !== "function" || typeof fullscreenHost[hostMethod] !== "function") continue;
+      const original = videoElement[videoMethod];
+      try {
+        videoElement[videoMethod] = (...args) => fullscreenHost[hostMethod](...args);
+        originals.push([videoMethod, original]);
+      } catch (error) {
+        console.warn(`Could not patch ${videoMethod} for subtitle fullscreen overlay`, error);
+      }
+    }
+
+    return () => {
+      for (const [methodName, original] of originals) {
+        try {
+          videoElement[methodName] = original;
+        } catch (error) {
+          console.warn(`Could not restore ${methodName}`, error);
+        }
+      }
+    };
+  }
+
   function toSec(time) {
     const normalized = String(time).replace(",", ".");
     const [hours, minutes, seconds] = normalized.split(":");
@@ -200,6 +257,7 @@
     window.__subtitleTranslatorRunning = false;
     return;
   }
+  window.__subtitleRestoreFullscreen = patchVideoFullscreen(video);
 
   const subtitleDiv = document.createElement("div");
   subtitleDiv.id = "__subtitle_bilingual_overlay";
@@ -223,7 +281,39 @@
     pointerEvents: "none",
     fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
   });
-  document.body.appendChild(subtitleDiv);
+
+  function getFullscreenElement() {
+    return document.fullscreenElement
+      || document.webkitFullscreenElement
+      || document.mozFullScreenElement
+      || document.msFullscreenElement
+      || null;
+  }
+
+  function canHostOverlay(element) {
+    if (!element || !element.appendChild) return false;
+    return !["VIDEO", "IFRAME", "IMG", "CANVAS"].includes(element.tagName);
+  }
+
+  function getOverlayHost() {
+    const fullscreenElement = getFullscreenElement();
+    if (canHostOverlay(fullscreenElement)) return fullscreenElement;
+    return document.body;
+  }
+
+  function syncOverlayHost() {
+    const host = getOverlayHost();
+    if (subtitleDiv.parentElement !== host) {
+      host.appendChild(subtitleDiv);
+    }
+
+    Object.assign(subtitleDiv.style, {
+      position: host === document.body ? "fixed" : "absolute",
+      zIndex: "2147483647"
+    });
+  }
+
+  syncOverlayHost();
 
   let subtitles = [];
   try {
@@ -306,17 +396,46 @@
     try { engine.destroy(); } catch {}
     try { subtitleDiv.remove(); } catch {}
     try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
+    try { window.__subtitleRestoreFullscreen?.(); } catch {}
+    try { removeFullscreenListeners(); } catch {}
     try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
     clearPopupState();
     delete window.__subtitleTranslatorCleanup;
     delete window.__subtitleTimer;
     delete window.__subtitleVideo;
+    delete window.__subtitleRestoreFullscreen;
     delete window.__subtitleOnSeeked;
     delete window.__subtitleOnStorageChange;
     console.log("🧹 Script cleaned up");
   }
 
   window.__subtitleTranslatorCleanup = cleanup;
+
+  function addFullscreenListeners() {
+    const events = [
+      "fullscreenchange",
+      "webkitfullscreenchange",
+      "mozfullscreenchange",
+      "MSFullscreenChange"
+    ];
+    for (const eventName of events) {
+      document.addEventListener(eventName, syncOverlayHost);
+    }
+  }
+
+  function removeFullscreenListeners() {
+    const events = [
+      "fullscreenchange",
+      "webkitfullscreenchange",
+      "mozfullscreenchange",
+      "MSFullscreenChange"
+    ];
+    for (const eventName of events) {
+      document.removeEventListener(eventName, syncOverlayHost);
+    }
+  }
+
+  addFullscreenListeners();
 
   const startIndex = getSubtitleIndexByTime(video.currentTime);
   if (startIndex !== -1) {
