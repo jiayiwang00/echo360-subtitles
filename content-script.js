@@ -18,6 +18,11 @@
   const PROGRESS_STORAGE_KEY = "translationProgress";
   const SETTINGS_STORAGE_KEY = "translationSettings";
   const DEFAULT_TARGET_LANGUAGE = "zh-CN";
+  const DEFAULT_SUBTITLE_FONT_SIZE = 22;
+  const DEFAULT_SUBTITLE_POSITION = {
+    xPercent: 50,
+    bottomPercent: 10
+  };
 
   if (window.__subtitleTranslatorRunning) {
     console.warn("The script is already running. Run window.__subtitleTranslatorCleanup() before starting it again.");
@@ -56,14 +61,42 @@
     });
   }
 
-  async function getStoredTargetLanguage() {
+  function normalizeSubtitleFontSize(value) {
+    const size = Number(value);
+    if (!Number.isFinite(size)) return DEFAULT_SUBTITLE_FONT_SIZE;
+    return Math.max(14, Math.min(40, size));
+  }
+
+  function normalizeSubtitlePosition(position) {
+    return {
+      xPercent: Math.max(5, Math.min(95, Number(position?.xPercent) || DEFAULT_SUBTITLE_POSITION.xPercent)),
+      bottomPercent: Math.max(2, Math.min(80, Number(position?.bottomPercent) || DEFAULT_SUBTITLE_POSITION.bottomPercent))
+    };
+  }
+
+  async function getStoredSettings() {
     try {
-      if (!chrome?.storage?.local) return DEFAULT_TARGET_LANGUAGE;
+      if (!chrome?.storage?.local) {
+        return {
+          targetLanguage: DEFAULT_TARGET_LANGUAGE,
+          subtitleFontSize: DEFAULT_SUBTITLE_FONT_SIZE,
+          subtitlePosition: DEFAULT_SUBTITLE_POSITION
+        };
+      }
       const result = await chrome.storage.local.get(SETTINGS_STORAGE_KEY);
-      return result?.[SETTINGS_STORAGE_KEY]?.targetLanguage || DEFAULT_TARGET_LANGUAGE;
+      const settings = result?.[SETTINGS_STORAGE_KEY] || {};
+      return {
+        targetLanguage: settings.targetLanguage || DEFAULT_TARGET_LANGUAGE,
+        subtitleFontSize: normalizeSubtitleFontSize(settings.subtitleFontSize),
+        subtitlePosition: normalizeSubtitlePosition(settings.subtitlePosition)
+      };
     } catch (error) {
       console.warn("Failed to read translation settings", error);
-      return DEFAULT_TARGET_LANGUAGE;
+      return {
+        targetLanguage: DEFAULT_TARGET_LANGUAGE,
+        subtitleFontSize: DEFAULT_SUBTITLE_FONT_SIZE,
+        subtitlePosition: DEFAULT_SUBTITLE_POSITION
+      };
     }
   }
 
@@ -259,12 +292,13 @@
   }
   window.__subtitleRestoreFullscreen = patchVideoFullscreen(video);
 
+  let currentSettings = await getStoredSettings();
   const subtitleDiv = document.createElement("div");
   subtitleDiv.id = "__subtitle_bilingual_overlay";
   Object.assign(subtitleDiv.style, {
     position: "fixed",
-    left: "50%",
-    bottom: "10%",
+    left: `${currentSettings.subtitlePosition.xPercent}%`,
+    bottom: `${currentSettings.subtitlePosition.bottomPercent}%`,
     transform: "translateX(-50%)",
     zIndex: "2147483647",
     maxWidth: "70%",
@@ -272,15 +306,113 @@
     color: "#fff",
     background: "rgba(0,0,0,0.68)",
     borderRadius: "10px",
-    fontSize: "22px",
+    fontSize: `${currentSettings.subtitleFontSize}px`,
     lineHeight: "1.45",
     textAlign: "center",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
     boxShadow: "0 6px 24px rgba(0,0,0,0.35)",
-    pointerEvents: "none",
+    pointerEvents: "auto",
+    cursor: "move",
+    userSelect: "none",
+    touchAction: "none",
     fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
   });
+
+  function applySubtitleSettings(settings) {
+    currentSettings = {
+      ...currentSettings,
+      ...settings,
+      subtitleFontSize: normalizeSubtitleFontSize(settings?.subtitleFontSize),
+      subtitlePosition: normalizeSubtitlePosition(settings?.subtitlePosition)
+    };
+    subtitleDiv.style.fontSize = `${currentSettings.subtitleFontSize}px`;
+    subtitleDiv.style.left = `${currentSettings.subtitlePosition.xPercent}%`;
+    subtitleDiv.style.bottom = `${currentSettings.subtitlePosition.bottomPercent}%`;
+  }
+
+  async function saveSubtitlePosition(position) {
+    currentSettings = {
+      ...currentSettings,
+      subtitlePosition: normalizeSubtitlePosition(position)
+    };
+    try {
+      if (!chrome?.storage?.local) return;
+      await chrome.storage.local.set({ [SETTINGS_STORAGE_KEY]: currentSettings });
+    } catch (error) {
+      console.warn("Failed to save subtitle position", error);
+    }
+  }
+
+  function makeSubtitleDraggable() {
+    let dragState = null;
+
+    const getBounds = () => {
+      const fullscreenElement = getFullscreenElement();
+      if (!fullscreenElement || fullscreenElement === document.body || fullscreenElement === document.documentElement) {
+        return {
+          left: 0,
+          top: 0,
+          width: window.innerWidth,
+          height: window.innerHeight
+        };
+      }
+      const rect = fullscreenElement.getBoundingClientRect();
+      return {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height
+      };
+    };
+
+    const moveTo = event => {
+      if (!dragState) return;
+      const bounds = getBounds();
+      const xPx = event.clientX - bounds.left - dragState.offsetX;
+      const bottomPx = bounds.top + bounds.height - event.clientY - dragState.offsetBottom;
+      const xPercent = Math.max(5, Math.min(95, (xPx / bounds.width) * 100));
+      const bottomPercent = Math.max(2, Math.min(80, (bottomPx / bounds.height) * 100));
+
+      currentSettings.subtitlePosition = { xPercent, bottomPercent };
+      subtitleDiv.style.left = `${xPercent}%`;
+      subtitleDiv.style.bottom = `${bottomPercent}%`;
+    };
+
+    const stopDrag = event => {
+      if (!dragState) return;
+      try { subtitleDiv.releasePointerCapture(event.pointerId); } catch {}
+      const position = currentSettings.subtitlePosition;
+      dragState = null;
+      subtitleDiv.style.cursor = "move";
+      saveSubtitlePosition(position);
+    };
+
+    const startDrag = event => {
+      if (event.button !== undefined && event.button !== 0) return;
+      const bounds = getBounds();
+      const rect = subtitleDiv.getBoundingClientRect();
+      dragState = {
+        offsetX: event.clientX - (rect.left + rect.width / 2),
+        offsetBottom: bounds.top + bounds.height - event.clientY - (bounds.top + bounds.height - rect.bottom)
+      };
+      subtitleDiv.style.cursor = "grabbing";
+      try { subtitleDiv.setPointerCapture(event.pointerId); } catch {}
+      event.preventDefault();
+    };
+
+    subtitleDiv.addEventListener("pointerdown", startDrag);
+    subtitleDiv.addEventListener("pointermove", moveTo);
+    subtitleDiv.addEventListener("pointerup", stopDrag);
+    subtitleDiv.addEventListener("pointercancel", stopDrag);
+
+    return () => {
+      subtitleDiv.removeEventListener("pointerdown", startDrag);
+      subtitleDiv.removeEventListener("pointermove", moveTo);
+      subtitleDiv.removeEventListener("pointerup", stopDrag);
+      subtitleDiv.removeEventListener("pointercancel", stopDrag);
+    };
+  }
 
   function getFullscreenElement() {
     return document.fullscreenElement
@@ -308,12 +440,13 @@
     }
 
     Object.assign(subtitleDiv.style, {
-      position: host === document.body ? "fixed" : "absolute",
+      position: "fixed",
       zIndex: "2147483647"
     });
   }
 
   syncOverlayHost();
+  window.__subtitleRemoveDragListeners = makeSubtitleDraggable();
 
   let subtitles = [];
   try {
@@ -363,7 +496,7 @@
   const engine = new window.SubtitleTranslationEngine({
     config: CONFIG,
     subtitles,
-    initialLanguage: await getStoredTargetLanguage(),
+    initialLanguage: currentSettings.targetLanguage,
     defaultLanguage: DEFAULT_TARGET_LANGUAGE,
     getCurrentIndex: () => getSubtitleIndexByTime(video.currentTime),
     onProgress: progress => writePopupState(progress)
@@ -397,6 +530,7 @@
     try { subtitleDiv.remove(); } catch {}
     try { window.__subtitleVideo?.removeEventListener("seeked", window.__subtitleOnSeeked); } catch {}
     try { window.__subtitleRestoreFullscreen?.(); } catch {}
+    try { window.__subtitleRemoveDragListeners?.(); } catch {}
     try { removeFullscreenListeners(); } catch {}
     try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
     clearPopupState();
@@ -404,6 +538,7 @@
     delete window.__subtitleTimer;
     delete window.__subtitleVideo;
     delete window.__subtitleRestoreFullscreen;
+    delete window.__subtitleRemoveDragListeners;
     delete window.__subtitleOnSeeked;
     delete window.__subtitleOnStorageChange;
     console.log("🧹 Script cleaned up");
@@ -447,7 +582,13 @@
 
   window.__subtitleOnStorageChange = (changes, areaName) => {
     if (areaName !== "local" || !changes[SETTINGS_STORAGE_KEY]) return;
-    const nextLanguage = changes[SETTINGS_STORAGE_KEY].newValue?.targetLanguage || DEFAULT_TARGET_LANGUAGE;
+    const nextSettings = {
+      targetLanguage: changes[SETTINGS_STORAGE_KEY].newValue?.targetLanguage || DEFAULT_TARGET_LANGUAGE,
+      subtitleFontSize: normalizeSubtitleFontSize(changes[SETTINGS_STORAGE_KEY].newValue?.subtitleFontSize),
+      subtitlePosition: normalizeSubtitlePosition(changes[SETTINGS_STORAGE_KEY].newValue?.subtitlePosition)
+    };
+    applySubtitleSettings(nextSettings);
+    const nextLanguage = nextSettings.targetLanguage;
     engine.setTargetLanguage(nextLanguage);
     lastRenderedSubtitleText = "";
     renderSubtitle(null);
