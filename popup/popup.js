@@ -2,6 +2,13 @@ const STATE_KEY = "translationProgress";
 const SETTINGS_KEY = "translationSettings";
 const REFRESH_MS = 500;
 const DEFAULT_LANGUAGE = "zh-CN";
+const DEFAULT_FONT_SIZE = 22;
+const FONT_SIZES = [
+  { value: 16, label: "Small" },
+  { value: 22, label: "Medium" },
+  { value: 28, label: "Large" },
+  { value: 34, label: "Extra large" }
+];
 const LANGUAGES = [
   { value: "zh-CN", label: "Chinese (Simplified) 简体中文" },
   { value: "zh-TW", label: "Chinese (Traditional) 繁體中文" },
@@ -22,6 +29,7 @@ const uniqueValue = document.getElementById("uniqueValue");
 const queueValue = document.getElementById("queueValue");
 const activeText = document.getElementById("activeText");
 const languageSelect = document.getElementById("languageSelect");
+const fontSizeSelect = document.getElementById("fontSizeSelect");
 const translateButton = document.getElementById("translateButton");
 let hasLoadedSettings = false;
 
@@ -33,6 +41,33 @@ function renderLanguageOptions() {
     return option;
   });
   languageSelect.replaceChildren(...options);
+}
+
+function renderFontSizeOptions() {
+  const options = FONT_SIZES.map(size => {
+    const option = document.createElement("option");
+    option.value = String(size.value);
+    option.textContent = size.label;
+    return option;
+  });
+  fontSizeSelect.replaceChildren(...options);
+}
+
+function normalizeFontSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) return DEFAULT_FONT_SIZE;
+  return Math.max(14, Math.min(40, size));
+}
+
+async function updateSettings(patch) {
+  const result = await chrome.storage.local.get(SETTINGS_KEY);
+  const current = result?.[SETTINGS_KEY] || {};
+  await chrome.storage.local.set({
+    [SETTINGS_KEY]: {
+      ...current,
+      ...patch
+    }
+  });
 }
 
 function clampPercent(value) {
@@ -72,7 +107,9 @@ async function refreshProgress() {
 
 async function loadSettings() {
   const result = await chrome.storage.local.get(SETTINGS_KEY);
-  languageSelect.value = result?.[SETTINGS_KEY]?.targetLanguage || DEFAULT_LANGUAGE;
+  const settings = result?.[SETTINGS_KEY] || {};
+  languageSelect.value = settings.targetLanguage || DEFAULT_LANGUAGE;
+  fontSizeSelect.value = String(normalizeFontSize(settings.subtitleFontSize));
   hasLoadedSettings = true;
 }
 
@@ -82,7 +119,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     renderState(changes[STATE_KEY].newValue);
   }
   if (changes[SETTINGS_KEY]) {
-    languageSelect.value = changes[SETTINGS_KEY].newValue?.targetLanguage || DEFAULT_LANGUAGE;
+    const settings = changes[SETTINGS_KEY].newValue || {};
+    languageSelect.value = settings.targetLanguage || DEFAULT_LANGUAGE;
+    fontSizeSelect.value = String(normalizeFontSize(settings.subtitleFontSize));
     hasLoadedSettings = true;
   }
 });
@@ -90,17 +129,23 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 translateButton.addEventListener("click", async () => {
   translateButton.disabled = true;
   try {
-    await chrome.storage.local.set({
-      [SETTINGS_KEY]: {
-        targetLanguage: languageSelect.value || DEFAULT_LANGUAGE
-      }
+    await updateSettings({
+      targetLanguage: languageSelect.value || DEFAULT_LANGUAGE,
+      subtitleFontSize: normalizeFontSize(fontSizeSelect.value)
     });
   } finally {
     translateButton.disabled = false;
   }
 });
 
+fontSizeSelect.addEventListener("change", async () => {
+  await updateSettings({
+    subtitleFontSize: normalizeFontSize(fontSizeSelect.value)
+  });
+});
+
 renderLanguageOptions();
+renderFontSizeOptions();
 if (!hasLoadedSettings) loadSettings();
 refreshProgress();
 setInterval(refreshProgress, REFRESH_MS);
