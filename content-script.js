@@ -3,6 +3,10 @@
   const CONFIG = {
     REQUEST_SPACING_MS: 120,
     MAX_CONCURRENT_REQUESTS: 3,
+    DEEPSEEK_URGENT_BATCH_SIZE: 4,
+    DEEPSEEK_BACKGROUND_BATCH_SIZE: 12,
+    DEEPSEEK_MAX_CONSECUTIVE_FAILURES: 10,
+    DEEPSEEK_RETRY_DELAY_MS: 800,
     CACHE_LIMIT: 500,
     LOOKAHEAD_COUNT: 3,
     UI_UPDATE_INTERVAL: 100,
@@ -17,7 +21,12 @@
   };
   const PROGRESS_STORAGE_KEY = "translationProgress";
   const SETTINGS_STORAGE_KEY = "translationSettings";
+  const TRANSLATION_CACHE_STORAGE_KEY = "persistentTranslationCacheV1";
+  const TRANSLATION_CACHE_LIMIT = 2500;
+  const TRANSLATION_CACHE_WRITE_DELAY = 300;
   const DEFAULT_TARGET_LANGUAGE = "zh-CN";
+  const DEFAULT_TRANSLATION_PROVIDER = "google";
+  const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
   const DEFAULT_SUBTITLE_FONT_SIZE = 22;
   const DEFAULT_SUBTITLE_POSITION = {
     xPercent: 50,
@@ -74,11 +83,92 @@
     };
   }
 
+  function hashCacheText(text) {
+    let hash = 2166136261;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index++) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function makePersistentCacheKey({ text, targetLanguage, translationProvider, deepseekModel }) {
+    const provider = translationProvider === "deepseek" ? "deepseek" : "google";
+    const model = provider === "deepseek" ? String(deepseekModel || DEFAULT_DEEPSEEK_MODEL) : "free";
+    return `${provider}:${model}:${targetLanguage}:${hashCacheText(text)}`;
+  }
+
+  function trimPersistentCache(entries) {
+    const pairs = Object.entries(entries || {});
+    if (pairs.length <= TRANSLATION_CACHE_LIMIT) return Object.fromEntries(pairs);
+    pairs.sort((left, right) => (right[1]?.updatedAt || 0) - (left[1]?.updatedAt || 0));
+    return Object.fromEntries(pairs.slice(0, TRANSLATION_CACHE_LIMIT));
+  }
+
+  async function createPersistentTranslationCache() {
+    let entries = {};
+    const pendingEntries = {};
+    let writeTimer = null;
+
+    try {
+      const result = await chrome.storage.local.get(TRANSLATION_CACHE_STORAGE_KEY);
+      entries = trimPersistentCache(result?.[TRANSLATION_CACHE_STORAGE_KEY] || {});
+    } catch (error) {
+      console.warn("Failed to read persistent translation cache", error);
+    }
+
+    const flush = async () => {
+      if (writeTimer) clearTimeout(writeTimer);
+      writeTimer = null;
+      const updates = { ...pendingEntries };
+      for (const key of Object.keys(pendingEntries)) delete pendingEntries[key];
+      if (!Object.keys(updates).length || !isExtensionContextValid) return;
+
+      try {
+        const result = await chrome.storage.local.get(TRANSLATION_CACHE_STORAGE_KEY);
+        entries = trimPersistentCache({
+          ...(result?.[TRANSLATION_CACHE_STORAGE_KEY] || {}),
+          ...updates
+        });
+        await chrome.storage.local.set({ [TRANSLATION_CACHE_STORAGE_KEY]: entries });
+      } catch (error) {
+        Object.assign(pendingEntries, updates);
+        console.warn("Failed to write persistent translation cache", error);
+      }
+    };
+
+    return {
+      get(descriptor) {
+        const source = String(descriptor.text || "");
+        const entry = entries[makePersistentCacheKey(descriptor)];
+        return entry?.source === source ? entry.translation : null;
+      },
+      set(descriptor) {
+        const key = makePersistentCacheKey(descriptor);
+        const entry = {
+          source: String(descriptor.text || ""),
+          translation: String(descriptor.translation || ""),
+          updatedAt: Date.now()
+        };
+        entries[key] = entry;
+        pendingEntries[key] = entry;
+        if (writeTimer) return;
+        writeTimer = setTimeout(flush, TRANSLATION_CACHE_WRITE_DELAY);
+      },
+      flush
+    };
+  }
+
   async function getStoredSettings() {
     try {
       if (!chrome?.storage?.local) {
         return {
           targetLanguage: DEFAULT_TARGET_LANGUAGE,
+          translationProvider: DEFAULT_TRANSLATION_PROVIDER,
+          deepseekApiKey: "",
+          deepseekModel: DEFAULT_DEEPSEEK_MODEL,
+          translationRequestId: 0,
           subtitleFontSize: DEFAULT_SUBTITLE_FONT_SIZE,
           subtitlePosition: DEFAULT_SUBTITLE_POSITION
         };
@@ -87,6 +177,10 @@
       const settings = result?.[SETTINGS_STORAGE_KEY] || {};
       return {
         targetLanguage: settings.targetLanguage || DEFAULT_TARGET_LANGUAGE,
+        translationProvider: settings.translationProvider === "deepseek" ? "deepseek" : "google",
+        deepseekApiKey: String(settings.deepseekApiKey || "").trim(),
+        deepseekModel: String(settings.deepseekModel || DEFAULT_DEEPSEEK_MODEL).trim(),
+        translationRequestId: settings.translationRequestId || 0,
         subtitleFontSize: normalizeSubtitleFontSize(settings.subtitleFontSize),
         subtitlePosition: normalizeSubtitlePosition(settings.subtitlePosition)
       };
@@ -94,6 +188,10 @@
       console.warn("Failed to read translation settings", error);
       return {
         targetLanguage: DEFAULT_TARGET_LANGUAGE,
+        translationProvider: DEFAULT_TRANSLATION_PROVIDER,
+        deepseekApiKey: "",
+        deepseekModel: DEFAULT_DEEPSEEK_MODEL,
+        translationRequestId: 0,
         subtitleFontSize: DEFAULT_SUBTITLE_FONT_SIZE,
         subtitlePosition: DEFAULT_SUBTITLE_POSITION
       };
@@ -293,6 +391,7 @@
   window.__subtitleRestoreFullscreen = patchVideoFullscreen(video);
 
   let currentSettings = await getStoredSettings();
+  const persistentTranslationCache = await createPersistentTranslationCache();
   const subtitleDiv = document.createElement("div");
   subtitleDiv.id = "__subtitle_bilingual_overlay";
   Object.assign(subtitleDiv.style, {
@@ -494,12 +593,20 @@
   }
 
   const engine = new window.SubtitleTranslationEngine({
-    config: CONFIG,
+    config: {
+      ...CONFIG,
+      translationProvider: currentSettings.translationProvider,
+      deepseekApiKey: currentSettings.deepseekApiKey,
+      deepseekModel: currentSettings.deepseekModel,
+      translationRequestId: currentSettings.translationRequestId
+    },
     subtitles,
     initialLanguage: currentSettings.targetLanguage,
     defaultLanguage: DEFAULT_TARGET_LANGUAGE,
     getCurrentIndex: () => getSubtitleIndexByTime(video.currentTime),
-    onProgress: progress => writePopupState(progress)
+    onProgress: progress => writePopupState(progress),
+    getPersistedTranslation: descriptor => persistentTranslationCache.get(descriptor),
+    savePersistedTranslation: descriptor => persistentTranslationCache.set(descriptor)
   });
 
   function renderSubtitle(sub) {
@@ -524,6 +631,7 @@
 
   function cleanup() {
     window.__subtitleTranslatorRunning = false;
+    try { persistentTranslationCache.flush(); } catch {}
     isExtensionContextValid = false;
     try { clearInterval(window.__subtitleTimer); } catch {}
     try { engine.destroy(); } catch {}
@@ -533,6 +641,7 @@
     try { window.__subtitleRemoveDragListeners?.(); } catch {}
     try { removeFullscreenListeners(); } catch {}
     try { chrome.storage.onChanged.removeListener(window.__subtitleOnStorageChange); } catch {}
+    try { window.removeEventListener("pagehide", window.__subtitleOnPageHide); } catch {}
     clearPopupState();
     delete window.__subtitleTranslatorCleanup;
     delete window.__subtitleTimer;
@@ -541,10 +650,13 @@
     delete window.__subtitleRemoveDragListeners;
     delete window.__subtitleOnSeeked;
     delete window.__subtitleOnStorageChange;
+    delete window.__subtitleOnPageHide;
     console.log("🧹 Script cleaned up");
   }
 
   window.__subtitleTranslatorCleanup = cleanup;
+  window.__subtitleOnPageHide = () => persistentTranslationCache.flush();
+  window.addEventListener("pagehide", window.__subtitleOnPageHide);
 
   function addFullscreenListeners() {
     const events = [
@@ -584,12 +696,15 @@
     if (areaName !== "local" || !changes[SETTINGS_STORAGE_KEY]) return;
     const nextSettings = {
       targetLanguage: changes[SETTINGS_STORAGE_KEY].newValue?.targetLanguage || DEFAULT_TARGET_LANGUAGE,
+      translationProvider: changes[SETTINGS_STORAGE_KEY].newValue?.translationProvider === "deepseek" ? "deepseek" : "google",
+      deepseekApiKey: String(changes[SETTINGS_STORAGE_KEY].newValue?.deepseekApiKey || "").trim(),
+      deepseekModel: String(changes[SETTINGS_STORAGE_KEY].newValue?.deepseekModel || DEFAULT_DEEPSEEK_MODEL).trim(),
+      translationRequestId: changes[SETTINGS_STORAGE_KEY].newValue?.translationRequestId || 0,
       subtitleFontSize: normalizeSubtitleFontSize(changes[SETTINGS_STORAGE_KEY].newValue?.subtitleFontSize),
       subtitlePosition: normalizeSubtitlePosition(changes[SETTINGS_STORAGE_KEY].newValue?.subtitlePosition)
     };
     applySubtitleSettings(nextSettings);
-    const nextLanguage = nextSettings.targetLanguage;
-    engine.setTargetLanguage(nextLanguage);
+    engine.setTranslationConfig(nextSettings);
     lastRenderedSubtitleText = "";
     renderSubtitle(null);
   };

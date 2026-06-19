@@ -13,7 +13,13 @@ Note: This code was generated with AI assistance [ChatGPT/Codex]
 - Supports multiple target languages:
   Chinese (Simplified), Chinese (Traditional), Spanish, French, German, Japanese, Korean, Russian, Arabic, and Portuguese
 - Lets users switch the target language from the extension popup
+- Lets users choose free Google translation or use DeepSeek with an API key and model name
+- Retries DeepSeek up to 10 consecutive failures before stopping and showing an API key/model warning, while Google continues retrying
+- Hides the DeepSeek API key by default with an optional visibility toggle
+- Uses small DeepSeek batches near playback and larger background batches to reduce requests and token usage
+- Uses a dedicated single-subtitle fast lane after seeking instead of waiting for an in-progress background batch
 - Uses caching to reduce duplicate translation requests
+- Persists translations locally so refreshing or reopening subtitles does not consume API tokens again
 - Optimized for random seeking with priority queues and concurrent translation workers
 - Shows a simplified translation progress view in the popup
 

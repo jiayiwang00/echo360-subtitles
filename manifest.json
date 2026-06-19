@@ -2,8 +2,12 @@
   "manifest_version": 3,
   "name": "Echo360 Subtitle Translator",
   "description": "Echo360 Subtitle Translator",
-  "version": "1.0.0",
+  "version": "1.6.0",
   "permissions": ["storage"],
+  "host_permissions": ["https://api.deepseek.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://echo360.net.au/*"],

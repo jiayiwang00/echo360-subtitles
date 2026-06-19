@@ -3,6 +3,8 @@ const SETTINGS_KEY = "translationSettings";
 const REFRESH_MS = 500;
 const DEFAULT_LANGUAGE = "zh-CN";
 const DEFAULT_FONT_SIZE = 22;
+const DEFAULT_PROVIDER = "google";
+const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 const FONT_SIZES = [
   { value: 16, label: "Small" },
   { value: 22, label: "Medium" },
@@ -29,9 +31,31 @@ const uniqueValue = document.getElementById("uniqueValue");
 const queueValue = document.getElementById("queueValue");
 const activeText = document.getElementById("activeText");
 const languageSelect = document.getElementById("languageSelect");
+const providerSelect = document.getElementById("providerSelect");
+const deepseekSettings = document.getElementById("deepseekSettings");
+const deepseekApiKey = document.getElementById("deepseekApiKey");
+const toggleApiKey = document.getElementById("toggleApiKey");
+const deepseekModel = document.getElementById("deepseekModel");
+const settingsError = document.getElementById("settingsError");
+const apiError = document.getElementById("apiError");
+const apiErrorText = document.getElementById("apiErrorText");
 const fontSizeSelect = document.getElementById("fontSizeSelect");
 const translateButton = document.getElementById("translateButton");
 let hasLoadedSettings = false;
+
+function renderProviderSettings() {
+  deepseekSettings.hidden = providerSelect.value !== "deepseek";
+  settingsError.hidden = true;
+}
+
+function applySettingsToForm(settings) {
+  languageSelect.value = settings.targetLanguage || DEFAULT_LANGUAGE;
+  fontSizeSelect.value = String(normalizeFontSize(settings.subtitleFontSize));
+  providerSelect.value = settings.translationProvider === "deepseek" ? "deepseek" : DEFAULT_PROVIDER;
+  deepseekApiKey.value = settings.deepseekApiKey || "";
+  deepseekModel.value = settings.deepseekModel || DEFAULT_DEEPSEEK_MODEL;
+  renderProviderSettings();
+}
 
 function renderLanguageOptions() {
   const options = LANGUAGES.map(language => {
@@ -98,6 +122,9 @@ function renderState(progress) {
   uniqueValue.textContent = `${uniqueDone}/${uniqueTotal}`;
   queueValue.textContent = String(queue);
   activeText.textContent = trimText(progress?.activeText);
+  const errorMessage = String(progress?.errorMessage || "").trim();
+  apiError.hidden = !errorMessage;
+  apiErrorText.textContent = errorMessage;
 }
 
 async function refreshProgress() {
@@ -108,8 +135,7 @@ async function refreshProgress() {
 async function loadSettings() {
   const result = await chrome.storage.local.get(SETTINGS_KEY);
   const settings = result?.[SETTINGS_KEY] || {};
-  languageSelect.value = settings.targetLanguage || DEFAULT_LANGUAGE;
-  fontSizeSelect.value = String(normalizeFontSize(settings.subtitleFontSize));
+  applySettingsToForm(settings);
   hasLoadedSettings = true;
 }
 
@@ -120,22 +146,45 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   }
   if (changes[SETTINGS_KEY]) {
     const settings = changes[SETTINGS_KEY].newValue || {};
-    languageSelect.value = settings.targetLanguage || DEFAULT_LANGUAGE;
-    fontSizeSelect.value = String(normalizeFontSize(settings.subtitleFontSize));
+    applySettingsToForm(settings);
     hasLoadedSettings = true;
   }
 });
 
 translateButton.addEventListener("click", async () => {
+  const provider = providerSelect.value === "deepseek" ? "deepseek" : "google";
+  const apiKey = deepseekApiKey.value.trim();
+  const model = deepseekModel.value.trim();
+  if (provider === "deepseek" && (!apiKey || !model)) {
+    settingsError.textContent = "DeepSeek requires both an API key and a model name.";
+    settingsError.hidden = false;
+    return;
+  }
+
   translateButton.disabled = true;
   try {
     await updateSettings({
       targetLanguage: languageSelect.value || DEFAULT_LANGUAGE,
-      subtitleFontSize: normalizeFontSize(fontSizeSelect.value)
+      subtitleFontSize: normalizeFontSize(fontSizeSelect.value),
+      translationProvider: provider,
+      deepseekApiKey: apiKey,
+      deepseekModel: model || DEFAULT_DEEPSEEK_MODEL,
+      translationRequestId: Date.now()
     });
+    settingsError.hidden = true;
   } finally {
     translateButton.disabled = false;
   }
+});
+
+providerSelect.addEventListener("change", renderProviderSettings);
+
+toggleApiKey.addEventListener("click", () => {
+  const shouldShow = deepseekApiKey.type === "password";
+  deepseekApiKey.type = shouldShow ? "text" : "password";
+  toggleApiKey.setAttribute("aria-pressed", String(shouldShow));
+  toggleApiKey.setAttribute("aria-label", shouldShow ? "Hide API key" : "Show API key");
+  toggleApiKey.title = shouldShow ? "Hide API key" : "Show API key";
 });
 
 fontSizeSelect.addEventListener("change", async () => {

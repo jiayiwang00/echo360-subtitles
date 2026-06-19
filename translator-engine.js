@@ -33,14 +33,28 @@ class SubtitleTranslationEngine {
     initialLanguage,
     defaultLanguage,
     getCurrentIndex,
-    onProgress
+    onProgress,
+    getPersistedTranslation,
+    savePersistedTranslation
   }) {
     this.config = config;
     this.subtitles = subtitles;
     this.targetLanguage = initialLanguage || defaultLanguage;
     this.defaultLanguage = defaultLanguage;
+    this.translationProvider = config.translationProvider || "google";
+    this.deepseekApiKey = config.deepseekApiKey || "";
+    this.deepseekModel = config.deepseekModel || "deepseek-v4-flash";
+    this.translationRequestId = config.translationRequestId || 0;
+    this.translationStopped = false;
+    this.fatalError = "";
+    this.deepseekConsecutiveFailures = 0;
+    this.deepseekRequestsInFlight = 0;
+    this.lastDeepseekError = "";
+    this.retryStatus = "";
     this.getCurrentIndex = getCurrentIndex;
     this.onProgress = onProgress || (() => {});
+    this.getPersistedTranslation = getPersistedTranslation || (() => null);
+    this.savePersistedTranslation = savePersistedTranslation || (() => {});
 
     this.textToIndices = new Map();
     this.cachesByLanguage = new Map();
@@ -58,6 +72,7 @@ class SubtitleTranslationEngine {
       backgroundQueue: [],
       queuedPriority: new Map(),
       inFlightKeys: new Set(),
+      fastLaneInFlightKeys: new Set(),
       scheduledUniqueTexts: new Set(),
       completedUniqueTexts: new Set(),
       retryAttempts: new Map(),
@@ -97,15 +112,38 @@ class SubtitleTranslationEngine {
     return `${generation}::${text}`;
   }
 
+  getCacheKey(language = this.targetLanguage) {
+    const model = this.translationProvider === "deepseek" ? this.deepseekModel : "free";
+    return `${this.translationProvider}:${model}:${language}`;
+  }
+
   getLanguageCache(language = this.targetLanguage) {
-    if (!this.cachesByLanguage.has(language)) {
-      this.cachesByLanguage.set(language, new LRUCache(this.config.CACHE_LIMIT));
+    const cacheKey = this.getCacheKey(language);
+    if (!this.cachesByLanguage.has(cacheKey)) {
+      this.cachesByLanguage.set(cacheKey, new LRUCache(this.config.CACHE_LIMIT));
     }
-    return this.cachesByLanguage.get(language);
+    return this.cachesByLanguage.get(cacheKey);
   }
 
   getActiveCache() {
     return this.getLanguageCache(this.targetLanguage);
+  }
+
+  getCachedTranslation(text, language = this.targetLanguage) {
+    const cache = this.getLanguageCache(language);
+    const memoryValue = cache.get(text);
+    if (memoryValue) return memoryValue;
+
+    const persistedValue = this.getPersistedTranslation({
+      text,
+      targetLanguage: language,
+      translationProvider: this.translationProvider,
+      deepseekModel: this.deepseekModel
+    });
+    if (!persistedValue) return null;
+
+    cache.set(text, persistedValue);
+    return persistedValue;
   }
 
   getQueueLength() {
@@ -120,16 +158,23 @@ class SubtitleTranslationEngine {
     const percent = this.stats.total ? (this.stats.translated / this.stats.total) * 100 : 0;
     return {
       running: !this.destroyed,
-      statusText: this.stats.allDone
-        ? `Translation complete (${this.targetLanguage})`
-        : `Translating to ${this.targetLanguage}`,
+      statusText: this.fatalError
+        ? "DeepSeek translation stopped"
+        : this.retryStatus
+        ? this.retryStatus
+        : this.stats.allDone
+        ? this.stats.failed > 0
+          ? `Translation finished with ${this.stats.failed} failed (${this.translationProvider})`
+          : `Translation complete (${this.targetLanguage}, ${this.translationProvider})`
+        : `Translating to ${this.targetLanguage} with ${this.translationProvider}`,
       translated: this.stats.translated,
       total: this.stats.total,
       uniqueDone: this.stats.uniqueDone,
       uniqueTotal: this.uniqueTotal,
       queueLength: this.getQueueLength(),
       percent: Number(percent.toFixed(1)),
-      activeText: this.activeText
+      activeText: this.activeText,
+      errorMessage: this.fatalError
     };
   }
 
@@ -220,6 +265,11 @@ class SubtitleTranslationEngine {
   }
 
   scheduleRetry(text, error, generation) {
+    const status = this.getHttpStatus(error);
+    if (status && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+      return;
+    }
+
     const retryKey = this.makeGenerationTextKey(generation, text);
     if (this.retryTimers.has(retryKey)) return;
 
@@ -252,6 +302,33 @@ class SubtitleTranslationEngine {
     this.requestProgressSync();
   }
 
+  stopDeepSeekTranslation(error, generation, language) {
+    if (this.destroyed || generation !== this.generation || language !== this.targetLanguage) return;
+
+    this.generation += 1;
+    this.translationStopped = true;
+    const detail = String(error?.message || error || "Unknown error").slice(0, 300);
+    this.fatalError = `DeepSeek request failed. The API key or model may be incorrect. ${detail}`;
+
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    this.retryTimers.clear();
+    if (this.backgroundFillTimer) clearTimeout(this.backgroundFillTimer);
+    this.backgroundFillTimer = null;
+    this.engine.urgentQueue.length = 0;
+    this.engine.backgroundQueue.length = 0;
+    this.engine.queuedPriority.clear();
+
+    for (const sub of this.subtitles) {
+      if (sub.status !== "done") {
+        this.updateSubtitleState(sub, "failed", { error: this.fatalError });
+      }
+    }
+
+    this.stats.allDone = true;
+    this.updateQueueStats();
+    this.requestProgressSync(true);
+  }
+
   async googleTranslate(text, language) {
     const url =
       `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(language)}&dt=t&q=${encodeURIComponent(text)}`;
@@ -259,6 +336,25 @@ class SubtitleTranslationEngine {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     return data?.[0]?.map(part => part[0]).join("") || "";
+  }
+
+  async deepseekTranslateBatch(texts, language) {
+    if (!this.deepseekApiKey) throw new Error("DeepSeek API key is required");
+    if (!this.deepseekModel) throw new Error("DeepSeek model is required");
+
+    const response = await chrome.runtime.sendMessage({
+      type: "DEEPSEEK_TRANSLATE_BATCH",
+      apiKey: this.deepseekApiKey,
+      model: this.deepseekModel,
+      targetLanguage: language,
+      texts
+    });
+
+    if (!response?.ok) throw new Error(response?.error || "DeepSeek request failed");
+    if (!Array.isArray(response.translations) || response.translations.length !== texts.length) {
+      throw new Error("DeepSeek returned an incomplete translation batch");
+    }
+    return response.translations.map(translation => String(translation || "").trim());
   }
 
   async waitForRequestSlot() {
@@ -278,11 +374,71 @@ class SubtitleTranslationEngine {
     }
   }
 
-  async translateRateLimited(text, language) {
-    await this.waitForRequestSlot();
-    this.stats.requested += 1;
-    this.requestProgressSync();
-    return this.googleTranslate(text, language);
+  async translateRateLimited(texts, language, generation = this.generation) {
+    if (this.translationProvider !== "deepseek") {
+      await this.waitForRequestSlot();
+      this.stats.requested += 1;
+      this.requestProgressSync();
+      return Promise.all(texts.map(text => this.googleTranslate(text, language)));
+    }
+
+    const maxFailures = Math.max(1, Number(this.config.DEEPSEEK_MAX_CONSECUTIVE_FAILURES) || 10);
+    while (!this.destroyed && generation === this.generation && this.translationProvider === "deepseek") {
+      await this.waitForRequestSlot();
+
+      while (
+        this.deepseekConsecutiveFailures < maxFailures
+        && this.deepseekConsecutiveFailures + this.deepseekRequestsInFlight >= maxFailures
+        && !this.destroyed
+        && generation === this.generation
+      ) {
+        await this.sleep(25);
+      }
+
+      if (this.deepseekConsecutiveFailures >= maxFailures) {
+        throw new Error(
+          `DeepSeek failed ${maxFailures} consecutive attempts. Last error: ${this.lastDeepseekError || "Unknown error"}`
+        );
+      }
+
+      this.stats.requested += 1;
+      this.deepseekRequestsInFlight += 1;
+      this.requestProgressSync();
+
+      let requestError = null;
+      try {
+        const translations = await this.deepseekTranslateBatch(texts, language);
+        this.deepseekConsecutiveFailures = 0;
+        this.lastDeepseekError = "";
+        this.retryStatus = "";
+        this.requestProgressSync(true);
+        return translations;
+      } catch (error) {
+        requestError = error;
+      } finally {
+        this.deepseekRequestsInFlight = Math.max(0, this.deepseekRequestsInFlight - 1);
+      }
+
+      if (requestError) {
+        if (this.destroyed || generation !== this.generation || this.translationProvider !== "deepseek") {
+          throw requestError;
+        }
+
+        this.deepseekConsecutiveFailures += 1;
+        this.lastDeepseekError = String(requestError?.message || requestError || "Unknown error").slice(0, 300);
+        const failures = this.deepseekConsecutiveFailures;
+        if (failures >= maxFailures) {
+          this.retryStatus = "";
+          throw new Error(`DeepSeek failed ${maxFailures} consecutive attempts. Last error: ${this.lastDeepseekError}`);
+        }
+
+        this.retryStatus = `DeepSeek request failed. Retrying (${failures}/${maxFailures})...`;
+        this.requestProgressSync(true);
+        await this.sleep(Math.max(0, Number(this.config.DEEPSEEK_RETRY_DELAY_MS) || 800));
+      }
+    }
+
+    throw new Error("DeepSeek translation was cancelled");
   }
 
   removeFromQueue(queue, text) {
@@ -301,16 +457,33 @@ class SubtitleTranslationEngine {
     return nextText;
   }
 
+  dequeueNextBatch() {
+    if (this.translationProvider !== "deepseek") {
+      const text = this.dequeueNextText();
+      return text ? [text] : [];
+    }
+
+    const useUrgentQueue = this.engine.urgentQueue.length > 0;
+    const queue = useUrgentQueue ? this.engine.urgentQueue : this.engine.backgroundQueue;
+    const configuredLimit = useUrgentQueue
+      ? this.config.DEEPSEEK_URGENT_BATCH_SIZE
+      : this.config.DEEPSEEK_BACKGROUND_BATCH_SIZE;
+    const limit = Math.max(1, Number(configuredLimit) || 1);
+    const texts = queue.splice(0, limit);
+    for (const text of texts) this.engine.queuedPriority.delete(text);
+    if (texts.length) this.updateQueueStats();
+    return texts;
+  }
+
   enqueueText(text, priority = "background") {
     const normalized = String(text || "").replace(/\s+/g, " ").trim();
-    if (!normalized || this.destroyed) return;
+    if (!normalized || this.destroyed || this.translationStopped) return;
 
     this.stats.allDone = false;
-    const activeCache = this.getActiveCache();
     const inFlightKey = this.makeGenerationTextKey(this.generation, normalized);
 
-    if (activeCache.has(normalized)) {
-      const cached = activeCache.get(normalized);
+    const cached = this.getCachedTranslation(normalized);
+    if (cached) {
       this.stats.cacheHit += 1;
       this.applyTranslationToAll(normalized, cached, this.generation, this.targetLanguage);
       return;
@@ -346,7 +519,7 @@ class SubtitleTranslationEngine {
 
   isTranslationResolved() {
     return (
-      this.stats.translated === this.stats.total &&
+      this.stats.translated + this.stats.failed === this.stats.total &&
       this.getQueueLength() === 0 &&
       this.engine.inFlightKeys.size === 0 &&
       this.retryTimers.size === 0 &&
@@ -356,10 +529,10 @@ class SubtitleTranslationEngine {
 
   async workerLoop() {
     while (!this.destroyed) {
-      const nextText = this.dequeueNextText();
+      const nextTexts = this.dequeueNextBatch();
       this.requestProgressSync();
 
-      if (!nextText) {
+      if (!nextTexts.length) {
         if (!this.stats.allDone && this.isTranslationResolved()) {
           this.stats.allDone = true;
           this.requestProgressSync(true);
@@ -370,26 +543,50 @@ class SubtitleTranslationEngine {
 
       const requestGeneration = this.generation;
       const requestLanguage = this.targetLanguage;
-      const inFlightKey = this.makeGenerationTextKey(requestGeneration, nextText);
-      this.engine.inFlightKeys.add(inFlightKey);
+      const requestProvider = this.translationProvider;
+      const inFlightKeys = nextTexts.map(text => this.makeGenerationTextKey(requestGeneration, text));
+      for (const inFlightKey of inFlightKeys) this.engine.inFlightKeys.add(inFlightKey);
 
-      this.markAllSameText(nextText, sub => {
-        if (sub.status !== "done") this.updateSubtitleState(sub, "translating");
-      });
+      for (const text of nextTexts) {
+        this.markAllSameText(text, sub => {
+          if (sub.status !== "done") this.updateSubtitleState(sub, "translating");
+        });
+      }
       this.requestProgressSync();
 
       try {
-        const translation = await this.translateRateLimited(nextText, requestLanguage);
+        const translations = await this.translateRateLimited(nextTexts, requestLanguage, requestGeneration);
         if (this.destroyed) continue;
         if (requestGeneration !== this.generation || requestLanguage !== this.targetLanguage) continue;
-        this.getLanguageCache(requestLanguage).set(nextText, translation);
-        this.applyTranslationToAll(nextText, translation, requestGeneration, requestLanguage);
-        this.stats.lastTranslatedText = nextText;
+        for (const [index, text] of nextTexts.entries()) {
+          const translation = translations[index];
+          if (!translation) throw new Error("Translation batch contains an empty result");
+          if (this.engine.completedUniqueTexts.has(text)) continue;
+          this.getLanguageCache(requestLanguage).set(text, translation);
+          this.savePersistedTranslation({
+            text,
+            translation,
+            targetLanguage: requestLanguage,
+            translationProvider: this.translationProvider,
+            deepseekModel: this.deepseekModel
+          });
+          this.applyTranslationToAll(text, translation, requestGeneration, requestLanguage);
+          this.stats.lastTranslatedText = text;
+        }
       } catch (error) {
-        console.warn("Translation failed:", nextText, error);
-        this.markFailedForAll(nextText, error, requestGeneration, requestLanguage);
+        if (this.destroyed || requestGeneration !== this.generation || requestLanguage !== this.targetLanguage) {
+          continue;
+        }
+        console.warn("Translation failed:", nextTexts, error);
+        if (requestProvider === "deepseek") {
+          this.stopDeepSeekTranslation(error, requestGeneration, requestLanguage);
+        } else {
+          for (const text of nextTexts) {
+            this.markFailedForAll(text, error, requestGeneration, requestLanguage);
+          }
+        }
       } finally {
-        this.engine.inFlightKeys.delete(inFlightKey);
+        for (const inFlightKey of inFlightKeys) this.engine.inFlightKeys.delete(inFlightKey);
         this.updateQueueStats();
         this.requestProgressSync();
       }
@@ -412,7 +609,7 @@ class SubtitleTranslationEngine {
     if (!sub || !sub.text) return null;
     if (sub.translation) return sub.translation;
 
-    const cached = this.getActiveCache().get(sub.text);
+    const cached = this.getCachedTranslation(sub.text);
     if (cached) {
       this.applyTranslationToAll(sub.text, cached, this.generation, this.targetLanguage);
       return cached;
@@ -425,45 +622,111 @@ class SubtitleTranslationEngine {
     const sub = this.subtitles[index];
     if (!sub || !sub.text || sub.translation || sub.status === "translating") return;
 
-    const cached = this.getActiveCache().get(sub.text);
+    const cached = this.getCachedTranslation(sub.text);
     if (cached) {
       this.applyTranslationToAll(sub.text, cached, this.generation, this.targetLanguage);
       return;
     }
 
-    this.enqueueText(sub.text, "urgent");
+    this.enqueueUrgentSequence([sub.text]);
+  }
+
+  requestSeekFastLane(index) {
+    if (this.translationProvider !== "deepseek" || this.translationStopped || this.destroyed) return;
+    const sub = this.subtitles[index];
+    if (!sub?.text || sub.translation) return;
+
+    const cached = this.getCachedTranslation(sub.text);
+    if (cached) {
+      this.applyTranslationToAll(sub.text, cached, this.generation, this.targetLanguage);
+      return;
+    }
+
+    const requestGeneration = this.generation;
+    const requestLanguage = this.targetLanguage;
+    const text = sub.text;
+    const fastLaneKey = this.makeGenerationTextKey(requestGeneration, text);
+    if (this.engine.fastLaneInFlightKeys.has(fastLaneKey)) return;
+    this.engine.fastLaneInFlightKeys.add(fastLaneKey);
+
+    this.markAllSameText(text, item => {
+      if (item.status !== "done") this.updateSubtitleState(item, "translating");
+    });
+    this.requestProgressSync();
+
+    this.translateRateLimited([text], requestLanguage, requestGeneration)
+      .then(translations => {
+        if (this.destroyed || requestGeneration !== this.generation || requestLanguage !== this.targetLanguage) return;
+        const translation = String(translations?.[0] || "").trim();
+        if (!translation) throw new Error("DeepSeek returned an empty fast-lane translation");
+        this.getLanguageCache(requestLanguage).set(text, translation);
+        this.savePersistedTranslation({
+          text,
+          translation,
+          targetLanguage: requestLanguage,
+          translationProvider: "deepseek",
+          deepseekModel: this.deepseekModel
+        });
+        this.applyTranslationToAll(text, translation, requestGeneration, requestLanguage);
+        this.stats.lastTranslatedText = text;
+      })
+      .catch(error => {
+        if (this.destroyed || requestGeneration !== this.generation || requestLanguage !== this.targetLanguage) return;
+        console.warn("Seek fast-lane translation failed:", text, error);
+        this.stopDeepSeekTranslation(error, requestGeneration, requestLanguage);
+      })
+      .finally(() => {
+        this.engine.fastLaneInFlightKeys.delete(fastLaneKey);
+        this.requestProgressSync();
+      });
   }
 
   boostLookahead(index) {
+    const texts = [];
     for (let offset = 0; offset <= this.config.LOOKAHEAD_COUNT; offset++) {
       const sub = this.subtitles[index + offset];
       if (!sub || !sub.text || sub.translation) continue;
 
-      const cached = this.getActiveCache().get(sub.text);
+      const cached = this.getCachedTranslation(sub.text);
       if (cached) {
         this.applyTranslationToAll(sub.text, cached, this.generation, this.targetLanguage);
         continue;
       }
 
-      this.enqueueText(sub.text, "urgent");
+      texts.push(sub.text);
+    }
+    this.enqueueUrgentSequence(texts);
+  }
+
+  enqueueUrgentSequence(texts) {
+    const orderedTexts = [...new Set(texts.filter(Boolean))];
+    for (let index = orderedTexts.length - 1; index >= 0; index--) {
+      const text = orderedTexts[index];
+      if (this.engine.queuedPriority.get(text) === "urgent") {
+        this.removeFromQueue(this.engine.urgentQueue, text);
+        this.engine.queuedPriority.delete(text);
+      }
+      this.enqueueText(text, "urgent");
     }
   }
 
   enqueueWindowAround(index, forward = this.config.PRIORITY_FORWARD, backward = this.config.PRIORITY_BACKWARD) {
     if (index < 0) return;
 
+    const texts = [];
     const current = this.subtitles[index];
-    if (current?.text) this.enqueueText(current.text, "urgent");
+    if (current?.text) texts.push(current.text);
 
     for (let i = 1; i <= forward; i++) {
       const sub = this.subtitles[index + i];
-      if (sub?.text) this.enqueueText(sub.text, "urgent");
+      if (sub?.text) texts.push(sub.text);
     }
 
     for (let i = 1; i <= backward; i++) {
       const sub = this.subtitles[index - i];
-      if (sub?.text) this.enqueueText(sub.text, "urgent");
+      if (sub?.text) texts.push(sub.text);
     }
+    this.enqueueUrgentSequence(texts);
   }
 
   enqueueRemainingFrom(index) {
@@ -517,6 +780,7 @@ class SubtitleTranslationEngine {
     this.engine.backgroundQueue.length = 0;
     this.engine.queuedPriority.clear();
     this.engine.inFlightKeys.clear();
+    this.engine.fastLaneInFlightKeys.clear();
     this.engine.scheduledUniqueTexts.clear();
     this.engine.completedUniqueTexts.clear();
 
@@ -532,6 +796,12 @@ class SubtitleTranslationEngine {
     this.stats.allDone = false;
     this.stats.lastPriorityIndex = -1;
     this.activeText = "";
+    this.translationStopped = false;
+    this.fatalError = "";
+    this.deepseekConsecutiveFailures = 0;
+    this.deepseekRequestsInFlight = 0;
+    this.lastDeepseekError = "";
+    this.retryStatus = "";
 
     for (const sub of this.subtitles) {
       sub.translation = null;
@@ -567,8 +837,29 @@ class SubtitleTranslationEngine {
     this.resetTranslationState(normalized);
   }
 
+  setTranslationConfig({ targetLanguage, translationProvider, deepseekApiKey, deepseekModel, translationRequestId }) {
+    const nextLanguage = targetLanguage || this.defaultLanguage;
+    const nextProvider = translationProvider === "deepseek" ? "deepseek" : "google";
+    const nextApiKey = String(deepseekApiKey || "").trim();
+    const nextModel = String(deepseekModel || "deepseek-v4-flash").trim();
+    const nextRequestId = translationRequestId || 0;
+    const changed = nextLanguage !== this.targetLanguage
+      || nextProvider !== this.translationProvider
+      || nextApiKey !== this.deepseekApiKey
+      || nextModel !== this.deepseekModel
+      || nextRequestId !== this.translationRequestId;
+
+    if (!changed) return;
+    this.translationProvider = nextProvider;
+    this.deepseekApiKey = nextApiKey;
+    this.deepseekModel = nextModel;
+    this.translationRequestId = nextRequestId;
+    this.resetTranslationState(nextLanguage);
+  }
+
   handleSeek(index) {
     if (index === -1 || this.destroyed) return;
+    this.requestSeekFastLane(index);
     this.enqueueWindowAround(index, this.config.PRIORITY_FORWARD, this.config.PRIORITY_BACKWARD);
     this.scheduleBackgroundFill(index);
     this.stats.lastPriorityIndex = index;

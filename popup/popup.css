@@ -56,6 +56,7 @@ h1 {
 }
 
 .select,
+.input,
 .button {
   height: 38px;
   border: 0;
@@ -69,6 +70,102 @@ h1 {
   background: #fff;
   color: #1f2937;
   box-shadow: inset 0 0 0 1px #eadfc7;
+}
+
+.input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0 12px;
+  background: #fff;
+  color: #1f2937;
+  box-shadow: inset 0 0 0 1px #eadfc7;
+}
+
+.secret-input-row {
+  position: relative;
+}
+
+.secret-input-row .input {
+  padding-right: 44px;
+}
+
+.visibility-button {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: grid;
+  width: 34px;
+  height: 32px;
+  padding: 7px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #6b7280;
+  cursor: pointer;
+}
+
+.visibility-button:hover {
+  background: #f7f4eb;
+  color: #1f2937;
+}
+
+.eye-icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.eye-closed,
+.visibility-button[aria-pressed="true"] .eye-open {
+  display: none;
+}
+
+.visibility-button[aria-pressed="true"] .eye-closed {
+  display: block;
+}
+
+.nested-label {
+  margin-top: 10px;
+}
+
+.field-hint,
+.settings-error {
+  margin: 6px 2px 0;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.field-hint {
+  color: #7a8291;
+}
+
+.settings-error {
+  color: #b42318;
+}
+
+.api-error {
+  margin-bottom: 14px;
+  padding: 11px 12px;
+  border: 1px solid #f2b8b5;
+  border-radius: 10px;
+  background: #fff1f0;
+  color: #9f1c16;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.api-error strong,
+.api-error span {
+  display: block;
+}
+
+.api-error span {
+  margin-top: 3px;
+  word-break: break-word;
 }
 
 .button {

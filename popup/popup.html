@@ -13,11 +13,39 @@
       <p id="statusText" class="status">Waiting for translation...</p>
 
       <section class="controls">
+        <label class="control-label" for="providerSelect">Translation API</label>
+        <select id="providerSelect" class="select">
+          <option value="google">Google (free, no API key)</option>
+          <option value="deepseek">DeepSeek</option>
+        </select>
+      </section>
+
+      <section id="deepseekSettings" class="controls provider-settings" hidden>
+        <label class="control-label" for="deepseekApiKey">DeepSeek API key</label>
+        <div class="secret-input-row">
+          <input id="deepseekApiKey" class="input" type="password" autocomplete="off" placeholder="sk-..." />
+          <button id="toggleApiKey" class="visibility-button" type="button" aria-label="Show API key" aria-pressed="false" title="Show API key">
+            <svg class="eye-icon eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.7"/></svg>
+            <svg class="eye-icon eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18M10.6 6.1c.5-.1.9-.1 1.4-.1 6 0 9.5 6 9.5 6a16 16 0 0 1-2.2 2.8M6.2 6.2A16.2 16.2 0 0 0 2.5 12s3.5 6 9.5 6c1.5 0 2.8-.4 4-1"/></svg>
+          </button>
+        </div>
+        <label class="control-label nested-label" for="deepseekModel">Model name</label>
+        <input id="deepseekModel" class="input" type="text" autocomplete="off" placeholder="deepseek-v4-flash" />
+        <p class="field-hint">The key is stored locally in this browser profile.</p>
+      </section>
+
+      <section id="apiError" class="api-error" role="alert" hidden>
+        <strong>AI translation stopped</strong>
+        <span id="apiErrorText"></span>
+      </section>
+
+      <section class="controls">
         <label class="control-label" for="languageSelect">Target language</label>
         <div class="control-row">
           <select id="languageSelect" class="select"></select>
           <button id="translateButton" class="button" type="button">Translate</button>
         </div>
+        <p id="settingsError" class="settings-error" role="alert" hidden></p>
       </section>
 
       <section class="controls">
