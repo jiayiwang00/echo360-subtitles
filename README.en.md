@@ -2,6 +2,9 @@
 
 English | [简体中文](./README.md)
 
+[link](https://chromewebstore.google.com/detail/hlbagpkbdpfgndicgjnbckclhaokogan?utm_source=item-share-cb)
+
+
 **This is a Chrome extension for `Echo360`. It automatically reads `.vtt` subtitle files from the page and auto translate displays bilingual subtitles during video playback.**
 
 Note: This code was generated with AI assistance [ChatGPT/Codex]

@@ -2,6 +2,8 @@
 
 简体中文 | [English](./README.en.md)
 
+[跳转链接](https://chromewebstore.google.com/detail/hlbagpkbdpfgndicgjnbckclhaokogan?utm_source=item-share-cb)
+
 **这是一个用于 `Echo360` 的 Chrome 扩展。它会自动读取页面的字幕文件，并在视频播放时自动翻译并显示双语字幕。**
 
 Note: This code was generated with AI assistance [ChatGPT/Codex]
